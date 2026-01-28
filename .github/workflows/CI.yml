@@ -5,13 +5,13 @@
 #
 name: CI
 
-on: []
-  # push:
-  #   branches:
-  #     - main
-  #     - master
-  #   tags:
-  #     - '*'
+on:
+  push:
+    branches-ignore:
+      - main
+      - master
+    # tags:
+      # - '*'
   # pull_request:
   # workflow_dispatch:
 
