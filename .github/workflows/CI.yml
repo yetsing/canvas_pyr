@@ -5,15 +5,15 @@
 #
 name: CI
 
-on:
-  push:
-    branches:
-      - main
-      - master
-    tags:
-      - '*'
-  pull_request:
-  workflow_dispatch:
+on: []
+  # push:
+  #   branches:
+  #     - main
+  #     - master
+  #   tags:
+  #     - '*'
+  # pull_request:
+  # workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,10 +26,6 @@ jobs:
       matrix:
         python-version:
           - '3.10'
-          - '3.11'
-          - '3.12'
-          - '3.13'
-          - '3.14'
         platform:
           - runner: ubuntu-22.04
             target: x86_64
@@ -63,7 +59,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
-          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          name: wheels-cp${{ matrix.python-version }}-${{ matrix.platform.os }}-${{ matrix.platform.target }}
           path: dist
 
   sdist:
