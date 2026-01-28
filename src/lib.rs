@@ -8,6 +8,6 @@ mod canvas_pyr {
     /// Formats the sum of two numbers as string.
     #[pyfunction]
     fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-        Ok((a + b).to_string())
+        Ok((a + b + 0).to_string())
     }
 }
