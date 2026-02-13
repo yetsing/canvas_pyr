@@ -25,9 +25,9 @@ dev = [
 
 [tool.maturin]
 # Include additional files
-include = ["pkgdata/**/*"]
+include = ["icudtl.dat"]
 # Exclude files
-exclude = ["pkgdata/.keep"]
+exclude = []
 
 [tool.uv]
 package = false

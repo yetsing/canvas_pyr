@@ -77,7 +77,7 @@ def download_icu():
     )
     shutil.copy2(
         os.path.join(dirname, "..", ICU_DAT),
-        os.path.join(dirname, "..", "pkgdata", ICU_DAT),
+        os.path.join(dirname, "..", "canvas_pyr", ICU_DAT),
     )
 
 
