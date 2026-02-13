@@ -139,7 +139,9 @@ class CanvasTransform(Protocol):
         self, a: float, b: float, c: float, d: float, e: float, f: float
     ) -> None: ...
     @overload
-    def setTransform(self, transform: "DOMMatrix2DInit" | "DOMMatrix" | None = None) -> None: ...
+    def setTransform(
+        self, transform: "DOMMatrix2DInit" | "DOMMatrix" | None = None
+    ) -> None: ...
     def transform(
         self, a: float, b: float, c: float, d: float, e: float, f: float
     ) -> None: ...
@@ -162,7 +164,11 @@ class ImageDataSettings(TypedDict, total=False):
 class CanvasImageData(Protocol):
     @overload
     def createImageData(
-        self, sw: float, sh: float, settings: ImageDataSettings | None = None, /,
+        self,
+        sw: float,
+        sh: float,
+        settings: ImageDataSettings | None = None,
+        /,
     ) -> "ImageData": ...
     @overload
     def createImageData(self, imagedata: "ImageData", /) -> "ImageData": ...
@@ -259,7 +265,11 @@ class CanvasDrawPath(Protocol):
     def fill(self, path: "Path2D", fillRule: CanvasFillRule | None = None) -> None: ...
     @overload
     def isPointInPath(
-        self, x: float, y: float, fillRule: CanvasFillRule | None = None, /,
+        self,
+        x: float,
+        y: float,
+        fillRule: CanvasFillRule | None = None,
+        /,
     ) -> bool: ...
     @overload
     def isPointInPath(
@@ -397,9 +407,7 @@ class DOMMatrixReadOnly(Protocol):
         z: float = 0,
         angle: float = 0,
     ) -> "DOMMatrix": ...
-    def rotateFromVector(
-        self, x: float = 0, y: float = 0
-    ) -> "DOMMatrix": ...
+    def rotateFromVector(self, x: float = 0, y: float = 0) -> "DOMMatrix": ...
     def scale(
         self,
         scaleX: float | None = None,
@@ -421,7 +429,10 @@ class DOMMatrixReadOnly(Protocol):
     def toFloatArray(self) -> list[float]: ...
     def transformPoint(self, point: DOMPoint | None = None) -> "DOMPoint": ...
     def translate(
-        self, tx: float = 0, ty: float =0, tz: float =0,
+        self,
+        tx: float = 0,
+        ty: float = 0,
+        tz: float = 0,
     ) -> "DOMMatrix": ...
 
 class DOMMatrixDict(TypedDict):
@@ -454,6 +465,7 @@ class DOMMatrix(DOMMatrixReadOnly):
     """
     ref: https://developer.mozilla.org/en-US/docs/Web/API/DOMMatrix
     """
+
     a: float
     b: float
     c: float
@@ -491,7 +503,9 @@ class DOMMatrix(DOMMatrixReadOnly):
         angle: float = 0,
     ) -> Self: ...
     def rotateFromVectorSelf(
-        self, x: float = 0, y: float =0,
+        self,
+        x: float = 0,
+        y: float = 0,
     ) -> Self: ...
     def rotateSelf(
         self,
@@ -502,6 +516,7 @@ class DOMMatrix(DOMMatrixReadOnly):
         """
         If only one parameter is passed, rotZ is the value of rotX, and both rotX and rotY are 0, and the rotation is a 2D rotation.
         """
+
     def scale3dSelf(
         self,
         scale: float | None = None,
@@ -522,7 +537,10 @@ class DOMMatrix(DOMMatrixReadOnly):
     def skewXSelf(self, sx: float | None = None) -> Self: ...
     def skewYSelf(self, sy: float | None = None) -> Self: ...
     def translateSelf(
-        self, tx: float = 0, ty: float = 0, tz: float = 0,
+        self,
+        tx: float = 0,
+        ty: float = 0,
+        tz: float = 0,
     ) -> Self: ...
     def toJSON(self) -> DOMMatrixDict: ...
     @classmethod
@@ -539,7 +557,6 @@ class DOMRectReadOnly(Protocol):
     width: float
     x: float
     y: float
-
 
 class DOMRectDict(TypedDict):
     bottom: float
@@ -567,7 +584,6 @@ class DOMRect(DOMRectReadOnly):
     def toJSON(self) -> DOMRectDict: ...
     @classmethod
     def fromRect(cls, other: "DOMRect") -> "DOMRect": ...
-
 
 class DOMPointDict(TypedDict):
     w: float
@@ -734,10 +750,22 @@ class CanvasRenderingContext2D(
         self, startAngle: float, x: float, y: float
     ) -> CanvasGradient: ...
     @overload
-    def drawImage(self, image: Image | "Canvas", dx: float, dy: float, /,) -> None: ...
+    def drawImage(
+        self,
+        image: Image | "Canvas",
+        dx: float,
+        dy: float,
+        /,
+    ) -> None: ...
     @overload
     def drawImage(
-        self, image: Image | "Canvas", dx: float, dy: float, dw: float, dh: float, /,
+        self,
+        image: Image | "Canvas",
+        dx: float,
+        dy: float,
+        dw: float,
+        dh: float,
+        /,
     ) -> None: ...
     @overload
     def drawImage(
@@ -754,10 +782,22 @@ class CanvasRenderingContext2D(
         /,
     ) -> None: ...
     @overload
-    def drawCanvas(self, canvas: "Canvas", dx: float, dy: float, /,) -> None: ...
+    def drawCanvas(
+        self,
+        canvas: "Canvas",
+        dx: float,
+        dy: float,
+        /,
+    ) -> None: ...
     @overload
     def drawCanvas(
-        self, canvas: "Canvas", dx: float, dy: float, dw: float, dh: float, /,
+        self,
+        canvas: "Canvas",
+        dx: float,
+        dy: float,
+        dw: float,
+        dh: float,
+        /,
     ) -> None: ...
     @overload
     def drawCanvas(
@@ -841,7 +881,12 @@ class GifEncoder:
     ) -> None: ...
     def finish(self) -> bytes: ...
     def __enter__(self) -> Self: ...
-    def __exit__(self, exc_type: type | None, exc_value: BaseException | None, traceback: TracebackType | None) -> None: ...
+    def __exit__(
+        self,
+        exc_type: type | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
 
 class ChromaSubsampling(IntEnum):
     Yuv444 = 0
@@ -875,18 +920,22 @@ class Canvas:
     ) -> bytes: ...
     @overload
     def encode(self, format: Literal["gif"], quality: float | None = None) -> bytes: ...
-
     def data(self) -> bytes:
         """raw pixel data in RGBA order"""
 
     @overload
-    def toDataURL(self, mime: Literal['image/jpeg', "image/webp", 'image/png', 'image/gif'] = "image/png", quality: float | None = None) -> str: ...
+    def toDataURL(
+        self,
+        mime: Literal[
+            "image/jpeg", "image/webp", "image/png", "image/gif"
+        ] = "image/png",
+        quality: float | None = None,
+    ) -> str: ...
     @overload
-    def toDataURL(self, mime: Literal['image/avif'], cfg: AvifConfig | None = None) -> str: ...
-
+    def toDataURL(
+        self, mime: Literal["image/avif"], cfg: AvifConfig | None = None
+    ) -> str: ...
     def savePng(self, path: str) -> None: ...
-
-
 
 @overload
 def createCanvas(width: int, height: int) -> Canvas: ...
@@ -923,10 +972,10 @@ class FontStyleSet:
 
 class IGlobalFonts(Protocol):
     def getFamilies(self) -> list[FontStyleSet]: ...
-    def register(
-        self, font: bytes, nameAlias: str | None = None
+    def register(self, font: bytes, nameAlias: str | None = None) -> FontKey | None: ...
+    def registerFromPath(
+        self, path: str, nameAlias: str | None = None
     ) -> FontKey | None: ...
-    def registerFromPath(self, path: str, nameAlias: str | None = None) -> FontKey | None: ...
     def has(self, name: str) -> bool: ...
     def loadFontsFromDir(self, path: str) -> int: ...
     def setAlias(self, fontName: str, alias: str) -> bool: ...

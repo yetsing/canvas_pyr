@@ -30,3 +30,10 @@ version = "0.1.91"
 commit = "6661e25"
 url = "https://github.com/Brooooooklyn/canvas"
 license = "MIT"
+
+[project.optional-dependencies]
+dev = [
+    "maturin>=1.11.5,<2.0",
+    "pillow==12.1.0",
+    "tomli==2.4.0",
+]
