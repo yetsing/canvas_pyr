@@ -1,0 +1,7 @@
+__test__
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.webp
+canvas_upstream

@@ -9,4 +9,38 @@ name = "canvas_pyr"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27.0", features = ["extension-module"] }
+pyo3 = { version = "0.28.0", features = [] }
+anyhow          = "1"
+base64-simd     = "0.8"
+cssparser       = "0.35"
+cssparser-color = "0.3"
+gif             = "0.14"
+imagesize       = { version = "0.14", default-features = false, features = ["png", "jpeg", "gif", "webp", "heif"] }
+infer           = "0.19"
+libavif         = { version = "0.14", default-features = false, features = ["codec-aom"] }
+libavif-sys     = { version = "0.17", default-features = false, features = ["codec-aom"] }
+nom             = "8"
+num_cpus        = "1"
+regex           = "1"
+rgb             = "0.8"
+serde           = "1"
+serde_derive    = "1"
+serde_json      = "1"
+thiserror       = "2"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+mimalloc-safe = { version = "0.1", features = ["skip_collect_on_exit"] }
+
+[target.'cfg(all(target_os = "linux", not(target_arch = "aarch64")))'.dependencies]
+mimalloc-safe = { version = "0.1", features = ["local_dynamic_tls", "skip_collect_on_exit"] }
+
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+mimalloc-safe = { version = "0.1", features = ["local_dynamic_tls", "no_opt_arch", "skip_collect_on_exit"] }
+
+[build-dependencies]
+cc         = "1"
+
+[profile.release]
+codegen-units = 1
+lto           = true
+strip         = "symbols"

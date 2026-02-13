@@ -1,0 +1,3244 @@
+use std::cell::RefCell;
+use std::f32::consts::PI;
+use std::result;
+use std::slice;
+use std::str::FromStr;
+use std::sync::LazyLock;
+
+use cssparser::{Parser, ParserInput};
+use cssparser_color::{Color as CSSColor, hsl_to_rgb};
+use libavif::AvifData;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict, PyString, PyWeakrefReference};
+use regex::Regex;
+use rgb::RGBA;
+
+use crate::a_either::{PyEither, PyEither3, PyEither4};
+use crate::a_geometry::DOMMatrix;
+use crate::font::FONT_MEDIUM_PX;
+use crate::font::parse_size_px;
+use crate::gif::GifConfig;
+use crate::global_fonts::get_font;
+use crate::page_recorder::PageRecorder;
+use crate::picture_recorder::PictureRecorder;
+use crate::sk::Canvas;
+use crate::{
+  CanvasElement, SVGCanvas,
+  avif::Config,
+  error::SkError,
+  filter::css_filter,
+  filter::css_filters_to_image_filter,
+  font::Font,
+  gradient::{CanvasGradient, Gradient},
+  image::*,
+  path::Path,
+  pattern::{CanvasPattern, Pattern},
+  sk::{
+    AlphaType, Bitmap, BlendMode, ColorSpace, FillType, FontVariantCaps, ImageFilter, LineMetrics,
+    MaskFilter, Matrix, Paint, PaintStyle, Path as SkPath, PathEffect, PathOp,
+    SkEncodedImageFormat, SkWMemoryStream, SkiaDataRef, Surface, SurfaceRef, Transform,
+  },
+  state::Context2dRenderingState,
+};
+
+static CSS_SIZE_REGEXP: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r#"(-?[\d\.]+)(%|px|pt|pc|in|cm|mm|%|em|ex|ch|rem|q)?\s*"#).unwrap());
+
+impl From<SkError> for PyErr {
+  fn from(err: SkError) -> PyErr {
+    PyValueError::new_err(format!("{err}"))
+  }
+}
+
+pub(crate) const MAX_TEXT_WIDTH: f32 = 100_000.0;
+
+pub struct Context {
+  pub(crate) surface: Surface,
+  pub(crate) page_recorder: Option<RefCell<PageRecorder>>, // Deferred rendering recorder (RefCell for interior mutability)
+  path: SkPath,
+  pub alpha: bool,
+  pub(crate) states: Vec<Context2dRenderingState>,
+  state: Context2dRenderingState,
+  pub width: u32,
+  pub height: u32,
+  pub color_space: ColorSpace,
+  pub stream: Option<SkWMemoryStream>,
+}
+
+impl Context {
+  pub fn new_svg(
+    width: u32,
+    height: u32,
+    svg_export_flag: crate::sk::SvgExportFlag,
+    color_space: ColorSpace,
+  ) -> PyResult<Self> {
+    let (surface, stream) = Surface::new_svg(
+      width,
+      height,
+      AlphaType::Premultiplied,
+      svg_export_flag,
+      color_space,
+    )
+    .ok_or_else(|| PyRuntimeError::new_err("Create skia svg surface failed"))?;
+    Ok(Context {
+      surface,
+      page_recorder: None, // SVG uses direct rendering
+      alpha: true,
+      path: SkPath::new(),
+      states: vec![],
+      state: Context2dRenderingState::default(),
+      width,
+      height,
+      color_space,
+      stream: Some(stream),
+    })
+  }
+
+  pub fn new(width: u32, height: u32, color_space: ColorSpace) -> PyResult<Self> {
+    let surface = Surface::new_rgba_premultiplied(width, height, color_space)
+      .ok_or_else(|| PyRuntimeError::new_err("Create skia surface failed"))?;
+    Ok(Context {
+      surface,
+      page_recorder: Some(RefCell::new(PageRecorder::new(width as f32, height as f32))), // Enable deferred rendering
+      alpha: true,
+      path: SkPath::new(),
+      states: vec![],
+      state: Context2dRenderingState::default(),
+      width,
+      height,
+      color_space,
+      stream: None,
+    })
+  }
+
+  // Create a Context from an existing Surface (e.g., from PDFDocument)
+  pub(crate) fn new_from_surface(surface: Surface, width: u32, height: u32) -> Self {
+    Context {
+      surface,
+      page_recorder: None, // PDF uses direct rendering
+      alpha: true,
+      path: SkPath::new(),
+      states: vec![],
+      state: Context2dRenderingState::default(),
+      width,
+      height,
+      color_space: ColorSpace::default(),
+      stream: None,
+    }
+  }
+
+  /// Flush deferred rendering to surface (if deferred mode is enabled)
+  pub fn flush(&mut self) {
+    if let Some(ref recorder) = self.page_recorder {
+      recorder.borrow_mut().playback_to(&mut self.surface.canvas);
+      // DON'T reset here - preserve layers for incremental rendering
+      // Reset only happens on canvas resize or explicit clear
+    }
+  }
+
+  /// Execute a canvas state operation on the appropriate canvas (recording or direct)
+  /// For deferred mode, operations are recorded to the PageRecorder
+  /// For direct mode (SVG, PDF), operations go directly to the surface
+  fn with_canvas_state<F>(&mut self, f: F)
+  where
+    F: FnOnce(&mut Canvas),
+  {
+    if let Some(ref recorder) = self.page_recorder {
+      let mut rec = recorder.borrow_mut();
+      if let Some(canvas) = rec.get_recording_canvas() {
+        f(canvas);
+        return;
+      }
+    }
+    // Direct mode - use surface canvas
+    f(&mut self.surface.canvas);
+  }
+
+  /// Sync transform state to PageRecorder for restoration after layer promotion
+  fn sync_transform_to_recorder(&self) {
+    if let Some(ref recorder) = self.page_recorder {
+      recorder.borrow_mut().set_transform(&self.state.transform);
+    }
+  }
+
+  /// Sync clip state to PageRecorder for restoration after layer promotion
+  fn sync_clip_to_recorder(&self) {
+    if let Some(ref recorder) = self.page_recorder {
+      recorder.borrow_mut().set_clip(self.state.clip_path.clone());
+    }
+  }
+
+  /// Execute a rendering operation on the appropriate canvas (recording or direct)
+  /// For deferred mode, operations are recorded to the PageRecorder
+  /// For direct mode (SVG, PDF), operations go directly to the surface
+  fn with_render_canvas<F>(&mut self, paint: &Paint, f: F) -> result::Result<(), SkError>
+  where
+    F: Fn(&mut Canvas, &Paint) -> result::Result<(), SkError>,
+  {
+    let blend_mode = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+
+    if let Some(ref recorder) = self.page_recorder {
+      let mut rec = recorder.borrow_mut();
+      if let Some(canvas) = rec.get_recording_canvas() {
+        // Use the recording canvas for deferred mode
+        return Self::render_canvas(canvas, paint, blend_mode, width, height, f);
+      }
+    }
+    // Direct mode - use surface canvas
+    Self::render_canvas(
+      &mut self.surface.canvas,
+      paint,
+      blend_mode,
+      width,
+      height,
+      f,
+    )
+  }
+
+  pub fn arc(
+    &mut self,
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    start_angle: f32,
+    end_angle: f32,
+    from_end: bool,
+  ) {
+    self
+      .path
+      .arc(center_x, center_y, radius, start_angle, end_angle, from_end);
+  }
+
+  pub fn arc_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, radius: f32) {
+    self.path.arc_to_tangent(x1, y1, x2, y2, radius);
+  }
+
+  pub fn ellipse(
+    &mut self,
+    x: f32,
+    y: f32,
+    radius_x: f32,
+    radius_y: f32,
+    rotation: f32,
+    start_angle: f32,
+    end_angle: f32,
+    ccw: bool,
+  ) {
+    self.path.ellipse(
+      x,
+      y,
+      radius_x,
+      radius_y,
+      rotation,
+      start_angle,
+      end_angle,
+      ccw,
+    );
+  }
+
+  pub fn begin_path(&mut self) {
+    let new_sub_path = SkPath::new();
+    self.path.swap(&new_sub_path);
+  }
+
+  pub fn bezier_curve_to(&mut self, cp1x: f32, cp1y: f32, cp2x: f32, cp2y: f32, x: f32, y: f32) {
+    self.path.cubic_to(cp1x, cp1y, cp2x, cp2y, x, y);
+  }
+
+  pub fn quadratic_curve_to(&mut self, cpx: f32, cpy: f32, x: f32, y: f32) {
+    self.path.quad_to(cpx, cpy, x, y);
+  }
+
+  pub fn clip(&mut self, path: Option<&mut SkPath>, fill_rule: FillType) {
+    let clip_path = match path {
+      Some(p) => {
+        p.set_fill_type(fill_rule);
+        p.clone()
+      }
+      None => {
+        self.path.set_fill_type(fill_rule);
+        self.path.clone()
+      }
+    };
+
+    // For state tracking (used by save/restore and layer promotion), compute the
+    // cumulative clip in device space. Transform the new path by the current CTM
+    // and intersect with the existing device-space clip.
+    let mut device_clip = clip_path.clone();
+    device_clip.transform_self(&self.state.transform);
+
+    if let Some(ref existing_clip) = self.state.clip_path
+      && !device_clip.op(existing_clip, PathOp::Intersect)
+    {
+      #[cfg(debug_assertions)]
+      eprintln!("Warning: Path intersection operation failed in clip()");
+      // op() failed (degenerate paths). Skip both Skia and state update
+      // to avoid divergence between tracked state and actual canvas clip.
+      return;
+    }
+
+    // Pass the raw path to Skia. Skia's clipPath() is cumulative and applies the
+    // current canvas CTM, so it correctly handles nested clips at different transforms.
+    self.with_canvas_state(|canvas| {
+      canvas.set_clip_path(&clip_path);
+    });
+
+    self.state.clip_path = Some(device_clip);
+    self.sync_clip_to_recorder();
+  }
+
+  pub fn clear_rect(
+    &mut self,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+  ) -> result::Result<(), SkError> {
+    // Optimization: If clearing the entire canvas with identity transform, reset the page recorder
+    // This prevents memory growth in game loops that clear each frame
+    // Only apply optimization if:
+    // - Transform is identity - otherwise the clear might not cover everything
+    // - No clip path - otherwise the clear is masked
+    // - No pending save/restore states - otherwise resetting would break the save stack
+    if x <= 0.0
+      && y <= 0.0
+      && (x + width) >= self.width as f32
+      && (y + height) >= self.height as f32
+      && self.page_recorder.is_some()
+      && self.state.transform.get_transform().is_identity()
+      && self.state.clip_path.is_none()
+      && self.states.is_empty()
+    {
+      // Full canvas clear - reset layers instead of accumulating
+      if let Some(ref recorder) = self.page_recorder {
+        recorder
+          .borrow_mut()
+          .reset(self.width as f32, self.height as f32);
+      }
+      // Also clear the main surface
+      self.surface.canvas.clear();
+      return Ok(());
+    }
+
+    // Partial clear - record as a clear operation
+    let mut paint = Paint::new();
+    paint.set_style(PaintStyle::Fill);
+    paint.set_color(0, 0, 0, 0);
+    paint.set_stroke_miter(10.0);
+    paint.set_blend_mode(BlendMode::Clear);
+    self.with_render_canvas(&paint, |canvas, paint| {
+      canvas.draw_rect(x, y, width, height, paint);
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  pub fn close_path(&mut self) {
+    self.path.close();
+  }
+
+  pub fn rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
+    self.path.add_rect(x, y, width, height);
+  }
+
+  pub fn round_rect(&mut self, x: f32, y: f32, width: f32, height: f32, radii: [f32; 4]) {
+    self.path.round_rect(x, y, width, height, radii);
+  }
+
+  pub fn save(&mut self) {
+    self.with_canvas_state(|canvas| {
+      canvas.save();
+    });
+    self.states.push(self.state.clone());
+    // Sync state to recorder at save time for layer promotion restoration
+    self.sync_transform_to_recorder();
+    self.sync_clip_to_recorder();
+    // Track save count for layer promotion restoration
+    if let Some(ref recorder) = self.page_recorder {
+      recorder.borrow_mut().increment_save();
+    }
+  }
+
+  pub fn restore(&mut self) {
+    if let Some(s) = self.states.pop() {
+      self.path.transform_self(&self.state.transform);
+      self.with_canvas_state(|canvas| {
+        canvas.restore();
+      });
+      if let Some(inverse) = s.transform.invert() {
+        self.path.transform_self(&inverse);
+      }
+      self.state = s;
+
+      // In deferred mode, explicitly restore canvas transform and clip.
+      // This is needed because layer promotion recreates the save stack with
+      // identity transform/no clip at save time, so canvas.restore() may not
+      // restore the correct state.
+      if self.page_recorder.is_some() {
+        let transform = self.state.transform.clone();
+        let clip = self.state.clip_path.clone();
+        // Re-apply clip if the restored state has one.
+        // The clip is stored in device space, so apply at identity transform first.
+        if let Some(ref clip_path) = clip {
+          self.with_canvas_state(|canvas| {
+            canvas.reset_transform();
+            canvas.set_clip_path(clip_path);
+          });
+        }
+        // Then restore the actual transform
+        self.with_canvas_state(|canvas| {
+          canvas.set_transform(&transform);
+        });
+      }
+
+      self.sync_transform_to_recorder();
+      self.sync_clip_to_recorder();
+      // Track save count for layer promotion restoration
+      if let Some(ref recorder) = self.page_recorder {
+        recorder.borrow_mut().decrement_save();
+      }
+    }
+  }
+
+  pub fn reset(&mut self) {
+    // Clear the backing buffer to transparent black and reset canvas state
+    self.with_canvas_state(|canvas| {
+      canvas.clear();
+      canvas.reset();
+    });
+
+    // Reset the page recorder if in deferred mode
+    if let Some(ref recorder) = self.page_recorder {
+      recorder
+        .borrow_mut()
+        .reset(self.width as f32, self.height as f32);
+      // Also clear main surface which accumulates content from flush() calls
+      self.surface.canvas.clear();
+    }
+
+    // Clear the current path
+    self.path = SkPath::new();
+
+    // Clear the drawing state stack
+    self.states.clear();
+
+    // Reset all styles to default
+    self.state = Context2dRenderingState::default();
+  }
+
+  pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32) -> result::Result<(), SkError> {
+    let stroke_paint = self.stroke_paint()?;
+
+    // Extract state for shadow rendering to avoid borrow conflicts
+    let shadow_paint = Self::shadow_blur_paint(&self.state, &stroke_paint);
+    let global_composite_operation = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+    let shadow_offset_x = self.state.shadow_offset_x;
+    let shadow_offset_y = self.state.shadow_offset_y;
+    let shadow_blur = self.state.shadow_blur;
+
+    self.with_render_canvas(&stroke_paint, |canvas, paint| {
+      if let Some(shadow_paint) = &shadow_paint {
+        // Use the special shadow rendering that allows shadows to extend beyond canvas bounds
+        Self::render_shadow_canvas(
+          canvas,
+          shadow_paint,
+          global_composite_operation,
+          width,
+          height,
+          shadow_offset_x,
+          shadow_offset_y,
+          shadow_blur,
+          |shadow_canvas, shadow_paint| {
+            shadow_canvas.save();
+            Self::apply_shadow_offset_matrix_to_canvas(
+              shadow_canvas,
+              shadow_offset_x,
+              shadow_offset_y,
+            )?;
+            shadow_canvas.draw_rect(x, y, w, h, shadow_paint);
+            shadow_canvas.restore();
+            Ok(())
+          },
+        )?;
+      };
+      canvas.draw_rect(x, y, w, h, paint);
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  pub fn translate(&mut self, x: f32, y: f32) {
+    let inverse = Matrix::translated(-x, -y);
+    self.path.transform_self(&inverse);
+    self.state.transform.pre_translate(x, y);
+    let transform = self.state.transform.clone();
+    self.with_canvas_state(|canvas| {
+      canvas.set_transform(&transform);
+    });
+    self.sync_transform_to_recorder();
+  }
+
+  pub fn transform(&mut self, ts: Matrix) -> result::Result<(), SkError> {
+    if let Some(inverse) = ts.invert() {
+      self.path.transform_self(&inverse);
+    }
+    self.state.transform = ts.multiply(&self.state.transform);
+    let transform = self.state.transform.clone();
+    self.with_canvas_state(|canvas| {
+      canvas.set_transform(&transform);
+    });
+    self.sync_transform_to_recorder();
+    Ok(())
+  }
+
+  pub fn rotate(&mut self, angle: f32) {
+    let degrees = angle / PI * 180f32;
+    let inverse = Matrix::rotated(-angle, 0.0, 0.0);
+    self.path.transform_self(&inverse);
+    self.state.transform.pre_rotate(degrees);
+    let transform = self.state.transform.clone();
+    self.with_canvas_state(|canvas| {
+      canvas.set_transform(&transform);
+    });
+    self.sync_transform_to_recorder();
+  }
+
+  pub fn scale(&mut self, x: f32, y: f32) {
+    if x != 0.0 && y != 0.0 {
+      let mut inverse = Matrix::identity();
+      inverse.pre_scale(1f32 / x, 1f32 / y);
+      self.path.transform_self(&inverse);
+    }
+    self.state.transform.pre_scale(x, y);
+    let transform = self.state.transform.clone();
+    self.with_canvas_state(|canvas| {
+      canvas.set_transform(&transform);
+    });
+    self.sync_transform_to_recorder();
+  }
+
+  pub fn set_transform(&mut self, ts: Matrix) {
+    self.state.transform = ts.clone();
+    self.with_canvas_state(|canvas| {
+      canvas.set_transform(&ts);
+    });
+    self.sync_transform_to_recorder();
+  }
+
+  pub fn reset_transform(&mut self) {
+    self.state.transform = Matrix::identity();
+    self.with_canvas_state(|canvas| {
+      canvas.reset_transform();
+    });
+    self.sync_transform_to_recorder();
+  }
+
+  pub fn stroke_text(
+    &mut self,
+    text: &str,
+    x: f32,
+    y: f32,
+    max_width: f32,
+  ) -> result::Result<(), SkError> {
+    let stroke_paint = self.stroke_paint()?;
+    let variations = self.state.font_variations.clone();
+    self.draw_text(
+      text.replace('\n', " ").as_str(),
+      x,
+      y,
+      max_width,
+      &stroke_paint,
+      &variations,
+    )?;
+    Ok(())
+  }
+
+  pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32) -> result::Result<(), SkError> {
+    let fill_paint = self.fill_paint()?;
+
+    // Extract state for shadow rendering to avoid borrow conflicts
+    let shadow_paint = Self::shadow_blur_paint(&self.state, &fill_paint);
+    let global_composite_operation = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+    let shadow_offset_x = self.state.shadow_offset_x;
+    let shadow_offset_y = self.state.shadow_offset_y;
+    let shadow_blur = self.state.shadow_blur;
+
+    self.with_render_canvas(&fill_paint, |canvas, paint| {
+      if let Some(shadow_paint) = &shadow_paint {
+        // Use the special shadow rendering that allows shadows to extend beyond canvas bounds
+        Self::render_shadow_canvas(
+          canvas,
+          shadow_paint,
+          global_composite_operation,
+          width,
+          height,
+          shadow_offset_x,
+          shadow_offset_y,
+          shadow_blur,
+          |shadow_canvas, shadow_paint| {
+            shadow_canvas.save();
+            Self::apply_shadow_offset_matrix_to_canvas(
+              shadow_canvas,
+              shadow_offset_x,
+              shadow_offset_y,
+            )?;
+            shadow_canvas.draw_rect(x, y, w, h, shadow_paint);
+            shadow_canvas.restore();
+            Ok(())
+          },
+        )?;
+      };
+
+      canvas.draw_rect(x, y, w, h, paint);
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  pub fn fill_text(
+    &mut self,
+    text: &str,
+    x: f32,
+    y: f32,
+    max_width: f32,
+  ) -> result::Result<(), SkError> {
+    let fill_paint = self.fill_paint()?;
+    let variations = self.state.font_variations.clone();
+    self.draw_text(
+      text.replace('\n', " ").as_str(),
+      x,
+      y,
+      max_width,
+      &fill_paint,
+      &variations,
+    )?;
+    Ok(())
+  }
+
+  pub fn stroke(&mut self, path: Option<&mut SkPath>) -> PyResult<()> {
+    let stroke_paint = self.stroke_paint()?;
+
+    // Clone the path to avoid borrow conflicts with with_render_canvas
+    let path_to_draw = match path {
+      Some(p) => p.clone(),
+      None => self.path.clone(),
+    };
+
+    // Extract state for shadow rendering to avoid borrow conflicts
+    let shadow_paint = Self::shadow_blur_paint(&self.state, &stroke_paint);
+    let global_composite_operation = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+    let shadow_offset_x = self.state.shadow_offset_x;
+    let shadow_offset_y = self.state.shadow_offset_y;
+    let shadow_blur = self.state.shadow_blur;
+
+    self.with_render_canvas(&stroke_paint, |canvas, paint| {
+      if let Some(shadow_paint) = &shadow_paint {
+        // Use the special shadow rendering that allows shadows to extend beyond canvas bounds
+        Self::render_shadow_canvas(
+          canvas,
+          shadow_paint,
+          global_composite_operation,
+          width,
+          height,
+          shadow_offset_x,
+          shadow_offset_y,
+          shadow_blur,
+          |shadow_canvas, shadow_paint| {
+            shadow_canvas.save();
+            Self::apply_shadow_offset_matrix_to_canvas(
+              shadow_canvas,
+              shadow_offset_x,
+              shadow_offset_y,
+            )?;
+            shadow_canvas.draw_path(&path_to_draw, shadow_paint);
+            shadow_canvas.restore();
+            Ok(())
+          },
+        )?;
+      }
+
+      canvas.draw_path(&path_to_draw, paint);
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  pub fn render_canvas<F>(
+    surface_canvas: &mut Canvas,
+    paint: &Paint,
+    blend_mode: BlendMode,
+    width: f32,
+    height: f32,
+    f: F,
+  ) -> result::Result<(), SkError>
+  where
+    F: Fn(&mut Canvas, &Paint) -> result::Result<(), SkError>,
+  {
+    match blend_mode {
+      BlendMode::SourceIn
+      | BlendMode::SourceOut
+      | BlendMode::DestinationIn
+      | BlendMode::DestinationOut
+      | BlendMode::DestinationATop
+      | BlendMode::Source => {
+        let mut layer_paint = paint.clone();
+        layer_paint.set_blend_mode(BlendMode::SourceOver);
+        let mut layer = PictureRecorder::new();
+        layer.begin_recording(0.0, 0.0, width, height);
+        if let Some(canvas) = layer.get_recording_canvas() {
+          f(canvas, &layer_paint)?;
+        }
+        if let Some(pict) = layer.finish_recording_as_picture() {
+          surface_canvas.save();
+          surface_canvas.draw_picture(&pict, &Matrix::identity(), paint);
+          surface_canvas.restore();
+        }
+        Ok(())
+      }
+      _ => {
+        f(surface_canvas, paint)?;
+        Ok(())
+      }
+    }
+  }
+
+  pub fn fill(
+    &mut self,
+    path: Option<&mut SkPath>,
+    fill_rule: FillType,
+  ) -> result::Result<(), SkError> {
+    let fill_paint = self.fill_paint()?;
+
+    // Clone the path and set fill type to avoid borrow conflicts with with_render_canvas
+    let path_to_draw = if let Some(p) = path {
+      p.set_fill_type(fill_rule);
+      p.clone()
+    } else {
+      self.path.set_fill_type(fill_rule);
+      self.path.clone()
+    };
+
+    // Extract state for shadow rendering to avoid borrow conflicts
+    let shadow_paint = Self::shadow_blur_paint(&self.state, &fill_paint);
+    let global_composite_operation = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+    let shadow_offset_x = self.state.shadow_offset_x;
+    let shadow_offset_y = self.state.shadow_offset_y;
+    let shadow_blur = self.state.shadow_blur;
+
+    self.with_render_canvas(&fill_paint, |canvas, paint| {
+      if let Some(shadow_paint) = &shadow_paint {
+        // Use the special shadow rendering that allows shadows to extend beyond canvas bounds
+        Self::render_shadow_canvas(
+          canvas,
+          shadow_paint,
+          global_composite_operation,
+          width,
+          height,
+          shadow_offset_x,
+          shadow_offset_y,
+          shadow_blur,
+          |shadow_canvas, shadow_paint| {
+            shadow_canvas.save();
+            Self::apply_shadow_offset_matrix_to_canvas(
+              shadow_canvas,
+              shadow_offset_x,
+              shadow_offset_y,
+            )?;
+            shadow_canvas.draw_path(&path_to_draw, shadow_paint);
+            shadow_canvas.restore();
+            Ok(())
+          },
+        )?;
+      }
+      canvas.draw_path(&path_to_draw, paint);
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  pub fn fill_paint(&self) -> result::Result<Paint, SkError> {
+    let last_state = &self.state;
+    let current_paint = &last_state.paint;
+    let mut paint = current_paint.clone();
+    paint.set_style(PaintStyle::Fill);
+    let alpha = current_paint.get_alpha();
+    match &last_state.fill_style {
+      Pattern::Color(c, _) => {
+        let color = Self::multiply_by_alpha(c, alpha);
+        paint.set_color(color.r, color.g, color.b, color.a);
+      }
+      Pattern::Gradient(g) => {
+        let current_transform = &last_state.transform;
+        let shader = g.get_shader(current_transform.get_transform())?;
+        paint.set_color(0, 0, 0, alpha);
+        paint.set_shader(&shader);
+      }
+      Pattern::Image(p) => {
+        if let Some(shader) = p.get_shader() {
+          paint.set_color(0, 0, 0, alpha);
+          paint.set_shader(&shader);
+        }
+      }
+    };
+    if !last_state.line_dash_list.is_empty() {
+      let path_effect = PathEffect::new_dash_path(
+        last_state.line_dash_list.as_slice(),
+        last_state.line_dash_offset,
+      )
+      .ok_or_else(|| SkError::Generic("Make line dash path effect failed".to_string()))?;
+      paint.set_path_effect(&path_effect);
+    }
+    if let Some(f) = &self.state.filter {
+      paint.set_image_filter(f);
+    }
+    Ok(paint)
+  }
+
+  pub fn set_filter(&mut self, filter_str: &str) -> result::Result<(), SkError> {
+    if filter_str.trim() == "none" {
+      self.state.filters_string = "none".to_owned();
+      self.state.filter = None;
+    } else {
+      let (_, filters) =
+        css_filter(filter_str).map_err(|e| SkError::StringToFillRuleError(format!("{e}")))?;
+      self.state.filter = css_filters_to_image_filter(filters);
+      self.state.filters_string = filter_str.to_owned();
+    }
+    Ok(())
+  }
+
+  pub fn get_font(&self) -> &str {
+    &self.state.font
+  }
+
+  pub fn set_font(&mut self, font: String) -> result::Result<(), SkError> {
+    self.state.font_style = Font::new(&font)?;
+    // Apply CSS font-variant-css2 to fontVariantCaps state.
+    // In font shorthand, it only supports `<font-variant-css2>= normal | small-caps`
+    // Spec: https://drafts.csswg.org/css-fonts/#font-prop
+    self.state.font_variant_caps = match self.state.font_style.variant {
+      crate::font::FontVariant::SmallCaps => FontVariantCaps::SmallCaps,
+      crate::font::FontVariant::Normal => FontVariantCaps::Normal,
+    };
+    self.state.font = font;
+    Ok(())
+  }
+
+  pub fn get_font_variation_settings(&self) -> &str {
+    &self.state.font_variation_settings
+  }
+
+  pub fn set_font_variation_settings(&mut self, settings: String) -> result::Result<(), SkError> {
+    let (settings, variations) = parse_font_variation_settings(&settings);
+    self.state.font_variation_settings = settings;
+    self.state.font_variations = variations;
+    Ok(())
+  }
+
+  pub fn get_stroke_width(&self) -> f32 {
+    self.state.paint.get_stroke_width()
+  }
+
+  pub fn get_miter_limit(&self) -> f32 {
+    self.state.paint.get_stroke_miter()
+  }
+
+  pub fn set_miter_limit(&mut self, miter_limit: f32) {
+    self.state.paint.set_stroke_miter(miter_limit);
+  }
+
+  pub fn get_global_alpha(&self) -> f64 {
+    self.state.paint.get_alpha() as f64 / 255.0
+  }
+
+  pub fn set_shadow_color(&mut self, shadow_color: String) -> result::Result<(), SkError> {
+    let mut parser_input = ParserInput::new(&shadow_color);
+    let mut parser = Parser::new(&mut parser_input);
+    let color = CSSColor::parse(&mut parser)
+      .map_err(|e| SkError::Generic(format!("Parse color [{}] error: {:?}", &shadow_color, e)))?;
+
+    match color {
+      CSSColor::CurrentColor => {
+        return Err(SkError::Generic(
+          "Color should not be `currentcolor` keyword".to_owned(),
+        ));
+      }
+      CSSColor::Rgba(rgba) => {
+        drop(parser_input);
+        self.state.shadow_color_string = shadow_color;
+        // Convert RgbaLegacy to RGBA<u8>
+        self.state.shadow_color = RGBA {
+          r: rgba.red,
+          g: rgba.green,
+          b: rgba.blue,
+          a: (rgba.alpha * 255.0) as u8,
+        };
+      }
+      CSSColor::Hsl(hsl) => {
+        let h = hsl.hue.unwrap_or(0.0) / 360.0;
+        let s = hsl.saturation.unwrap_or(0.0);
+        let l = hsl.lightness.unwrap_or(0.0);
+        let a = hsl.alpha.unwrap_or(1.0);
+
+        let (r, g, b) = hsl_to_rgb(h, s, l);
+
+        drop(parser_input);
+        self.state.shadow_color_string = shadow_color;
+        self.state.shadow_color = RGBA {
+          r: (r * 255.0) as u8,
+          g: (g * 255.0) as u8,
+          b: (b * 255.0) as u8,
+          a: (a * 255.0) as u8,
+        };
+      }
+      _ => {
+        return Err(SkError::Generic("Unsupported color format".to_owned()));
+      }
+    }
+    Ok(())
+  }
+
+  pub fn set_text_align(&mut self, text_align: String) -> result::Result<(), SkError> {
+    self.state.text_align = text_align.parse()?;
+    Ok(())
+  }
+
+  pub fn set_text_baseline(&mut self, text_baseline: String) -> result::Result<(), SkError> {
+    self.state.text_baseline = text_baseline.parse()?;
+    Ok(())
+  }
+
+  pub fn set_font_stretch(&mut self, stretch: String) -> result::Result<(), SkError> {
+    if let Some(s) = crate::font::parse_font_stretch(&stretch) {
+      self.state.font_stretch = s;
+      self.state.font_stretch_raw = stretch;
+    }
+    Ok(())
+  }
+
+  pub fn set_font_kerning(&mut self, kerning: String) -> result::Result<(), SkError> {
+    if let Ok(k) = kerning.parse() {
+      self.state.font_kerning = k;
+    }
+    Ok(())
+  }
+
+  pub fn set_font_variant_caps(&mut self, variant_caps: String) -> result::Result<(), SkError> {
+    if let Ok(v) = variant_caps.parse() {
+      self.state.font_variant_caps = v;
+    }
+    Ok(())
+  }
+
+  pub fn set_text_rendering(&mut self, rendering: String) -> result::Result<(), SkError> {
+    if let Ok(r) = rendering.parse() {
+      self.state.text_rendering = r;
+    }
+    Ok(())
+  }
+
+  pub fn set_lang(&mut self, lang: String) {
+    self.state.lang = lang;
+  }
+
+  pub fn get_image_data(
+    &mut self,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color_type: ColorSpace,
+  ) -> Option<Vec<u8>> {
+    // Use RecordingSurface for deferred mode - enables incremental rendering
+    if let Some(ref recorder) = self.page_recorder {
+      return recorder
+        .borrow_mut()
+        .get_pixels(x as u32, y as u32, w as u32, h as u32, color_type);
+    }
+
+    // Direct mode - read from main surface
+    self
+      .surface
+      .read_pixels(x as u32, y as u32, w as u32, h as u32, color_type)
+  }
+
+  pub fn set_line_dash(&mut self, line_dash_list: Vec<f32>) {
+    self.state.line_dash_list = line_dash_list;
+  }
+
+  fn stroke_paint(&self) -> result::Result<Paint, SkError> {
+    let last_state = &self.state;
+    let current_paint = &last_state.paint;
+    let mut paint = current_paint.clone();
+    paint.set_style(PaintStyle::Stroke);
+    let global_alpha = current_paint.get_alpha();
+    match &last_state.stroke_style {
+      Pattern::Color(c, _) => {
+        let color = Self::multiply_by_alpha(c, global_alpha);
+        paint.set_color(color.r, color.g, color.b, color.a);
+      }
+      Pattern::Gradient(g) => {
+        let current_transform = &last_state.transform;
+        let shader = g.get_shader(current_transform.get_transform())?;
+        paint.set_color(0, 0, 0, global_alpha);
+        paint.set_shader(&shader);
+      }
+      Pattern::Image(p) => {
+        if let Some(shader) = p.get_shader() {
+          paint.set_color(0, 0, 0, current_paint.get_alpha());
+          paint.set_shader(&shader);
+        }
+      }
+    };
+    if !last_state.line_dash_list.is_empty() {
+      let path_effect = PathEffect::new_dash_path(
+        last_state.line_dash_list.as_slice(),
+        last_state.line_dash_offset,
+      )
+      .ok_or_else(|| SkError::Generic("Make line dash path effect failed".to_string()))?;
+      paint.set_path_effect(&path_effect);
+    }
+    if let Some(f) = &self.state.filter {
+      paint.set_image_filter(f);
+    }
+    Ok(paint)
+  }
+
+  fn drop_shadow_paint(state: &Context2dRenderingState, paint: &Paint) -> Option<Paint> {
+    let shadow_color = &state.shadow_color;
+    let shadow_alpha = shadow_color.a;
+    if shadow_alpha == 0 {
+      return None;
+    }
+    if state.shadow_blur == 0f32 && state.shadow_offset_x == 0f32 && state.shadow_offset_y == 0f32 {
+      return None;
+    }
+    let mut drop_shadow_paint = paint.clone();
+    let a = shadow_color.a;
+    let r = shadow_color.r;
+    let g = shadow_color.g;
+    let b = shadow_color.b;
+    let transform = state.transform.get_transform();
+    let sigma_x = state.shadow_blur / (2f32 * transform.scale_x());
+    let sigma_y = state.shadow_blur / (2f32 * transform.scale_y());
+    let shadow_effect = ImageFilter::make_drop_shadow_only(
+      state.shadow_offset_x,
+      state.shadow_offset_y,
+      sigma_x,
+      sigma_y,
+      ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+      None,
+    )?;
+    drop_shadow_paint.set_alpha(shadow_alpha);
+    drop_shadow_paint.set_image_filter(&shadow_effect);
+    Some(drop_shadow_paint)
+  }
+
+  fn shadow_blur_paint(state: &Context2dRenderingState, paint: &Paint) -> Option<Paint> {
+    let shadow_color = &state.shadow_color;
+    let shadow_alpha = shadow_color.a;
+    if shadow_alpha == 0 {
+      return None;
+    }
+    if state.shadow_blur == 0f32 && state.shadow_offset_x == 0f32 && state.shadow_offset_y == 0f32 {
+      return None;
+    }
+    let mut drop_shadow_paint = paint.clone();
+    let a = shadow_color.a;
+    let r = shadow_color.r;
+    let g = shadow_color.g;
+    let b = shadow_color.b;
+    if state.shadow_blur == 0f32 {
+      // No blur, so set the paint color to the shadow color without any blur effects
+      drop_shadow_paint.set_color(r, g, b, a);
+    } else {
+      let transform = state.transform.get_transform();
+      let sigma_x = state.shadow_blur / (2f32 * transform.scale_x());
+      let sigma_y = state.shadow_blur / (2f32 * transform.scale_y());
+      // If sigma_x and sigma_y are zero, make_drop_shadow_only will return None
+      // So we need to handle that case separately
+      let shadow_effect = ImageFilter::make_drop_shadow_only(
+        0.0,
+        0.0,
+        sigma_x,
+        sigma_y,
+        ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+        None,
+      )?;
+      drop_shadow_paint.set_alpha(shadow_alpha);
+      drop_shadow_paint.set_image_filter(&shadow_effect);
+      let blur_effect = MaskFilter::make_blur(state.shadow_blur / 2f32)?;
+      drop_shadow_paint.set_mask_filter(&blur_effect);
+    }
+    Some(drop_shadow_paint)
+  }
+
+  pub(crate) fn draw_image(
+    &mut self,
+    bitmap: &Bitmap,
+    sx: f32,
+    sy: f32,
+    s_width: f32,
+    s_height: f32,
+    dx: f32,
+    dy: f32,
+    d_width: f32,
+    d_height: f32,
+  ) -> PyResult<()> {
+    let mut paint: Paint = self.fill_paint()?;
+    paint.set_alpha((self.state.global_alpha * 255.0).round() as u8);
+
+    // Extract state for shadow rendering to avoid borrow conflicts
+    let drop_shadow_paint = Self::drop_shadow_paint(&self.state, &paint);
+    let global_composite_operation = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+    let shadow_offset_x = self.state.shadow_offset_x;
+    let shadow_offset_y = self.state.shadow_offset_y;
+    let shadow_blur = self.state.shadow_blur;
+    let image_smoothing_enabled = self.state.image_smoothing_enabled;
+    let image_smoothing_quality = self.state.image_smoothing_quality;
+
+    self.with_render_canvas(&paint, |canvas: &mut Canvas, paint| {
+      if let Some(drop_shadow_paint) = &drop_shadow_paint {
+        // Use the special shadow rendering that allows shadows to extend beyond canvas bounds
+        Self::render_shadow_canvas(
+          canvas,
+          drop_shadow_paint,
+          global_composite_operation,
+          width,
+          height,
+          shadow_offset_x,
+          shadow_offset_y,
+          shadow_blur,
+          |shadow_canvas, shadow_paint| {
+            shadow_canvas.draw_image(
+              bitmap,
+              sx,
+              sy,
+              s_width,
+              s_height,
+              dx,
+              dy,
+              d_width,
+              d_height,
+              image_smoothing_enabled,
+              image_smoothing_quality,
+              shadow_paint,
+            );
+            Ok(())
+          },
+        )?;
+      }
+      canvas.draw_image(
+        bitmap,
+        sx,
+        sy,
+        s_width,
+        s_height,
+        dx,
+        dy,
+        d_width,
+        d_height,
+        image_smoothing_enabled,
+        image_smoothing_quality,
+        paint,
+      );
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  /// Get a composite picture of all recorded operations (for drawCanvas)
+  pub fn get_picture(&mut self) -> Option<crate::sk::SkPicture> {
+    if let Some(ref recorder) = self.page_recorder {
+      recorder.borrow_mut().get_picture()
+    } else {
+      // For non-deferred mode, we can't get a picture
+      // The caller should use get_bitmap instead
+      None
+    }
+  }
+
+  /// Draw another canvas, preserving vector graphics when possible.
+  /// When the source has a SkPicture, this avoids rasterization.
+  /// Shadow rendering requires additional FFI calls when enabled.
+  pub(crate) fn draw_canvas(
+    &mut self,
+    picture: &crate::sk::SkPicture,
+    sx: f32,
+    sy: f32,
+    s_width: f32,
+    s_height: f32,
+    dx: f32,
+    dy: f32,
+    d_width: f32,
+    d_height: f32,
+  ) -> PyResult<()> {
+    let mut paint: Paint = self.fill_paint()?;
+    paint.set_alpha((self.state.global_alpha * 255.0).round() as u8);
+
+    // Extract state for shadow rendering to avoid borrow conflicts
+    let drop_shadow_paint = Self::drop_shadow_paint(&self.state, &paint);
+    let global_composite_operation = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+    let shadow_offset_x = self.state.shadow_offset_x;
+    let shadow_offset_y = self.state.shadow_offset_y;
+    let shadow_blur = self.state.shadow_blur;
+
+    self.with_render_canvas(&paint, |canvas: &mut Canvas, paint| {
+      if let Some(drop_shadow_paint) = &drop_shadow_paint {
+        // Use the special shadow rendering that allows shadows to extend beyond canvas bounds
+        Self::render_shadow_canvas(
+          canvas,
+          drop_shadow_paint,
+          global_composite_operation,
+          width,
+          height,
+          shadow_offset_x,
+          shadow_offset_y,
+          shadow_blur,
+          |shadow_canvas, shadow_paint| {
+            shadow_canvas.draw_picture_rect(
+              picture,
+              sx,
+              sy,
+              s_width,
+              s_height,
+              dx,
+              dy,
+              d_width,
+              d_height,
+              shadow_paint,
+            );
+            Ok(())
+          },
+        )?;
+      }
+      canvas.draw_picture_rect(
+        picture, sx, sy, s_width, s_height, dx, dy, d_width, d_height, paint,
+      );
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  fn draw_text(
+    &mut self,
+    text: &str,
+    x: f32,
+    y: f32,
+    max_width: f32,
+    paint: &Paint,
+    variations: &[crate::sk::FontVariation],
+  ) -> result::Result<(), SkError> {
+    let font = get_font()?;
+
+    // Extract all state values to avoid borrow conflicts with with_render_canvas
+    let shadow_paint = Self::shadow_blur_paint(&self.state, paint);
+    let global_composite_operation = self.state.global_composite_operation;
+    let width = self.width as f32;
+    let height = self.height as f32;
+    let shadow_offset_x = self.state.shadow_offset_x;
+    let shadow_offset_y = self.state.shadow_offset_y;
+    let shadow_blur = self.state.shadow_blur;
+    let font_weight = self.state.font_style.weight;
+    let font_stretch = self.state.font_stretch;
+    let font_stretch_percentage = font_stretch.to_width_percentage();
+    let font_style_style = self.state.font_style.style;
+    let font_size = self.state.font_style.size;
+    let font_family = self.state.font_style.family.clone();
+    let text_baseline = self.state.text_baseline;
+    let text_align = self.state.text_align;
+    let text_direction = self.state.text_direction;
+    let letter_spacing = self.state.letter_spacing;
+    let word_spacing = self.state.word_spacing;
+    let font_kerning = self.state.font_kerning;
+    let font_variant_caps = self.state.font_variant_caps;
+    let lang = self.state.lang.clone();
+    let text_rendering = self.state.text_rendering;
+
+    self.with_render_canvas(paint, |canvas, paint| {
+      if let Some(shadow_paint) = &shadow_paint {
+        // Use the special shadow rendering that allows shadows to extend beyond canvas bounds
+        Self::render_shadow_canvas(
+          canvas,
+          shadow_paint,
+          global_composite_operation,
+          width,
+          height,
+          shadow_offset_x,
+          shadow_offset_y,
+          shadow_blur,
+          |shadow_canvas, shadow_paint| {
+            shadow_canvas.save();
+            Self::apply_shadow_offset_matrix_to_canvas(
+              shadow_canvas,
+              shadow_offset_x,
+              shadow_offset_y,
+            )?;
+            shadow_canvas.draw_text(
+              text,
+              x,
+              y,
+              max_width,
+              width,
+              font_weight,
+              font_stretch as i32,
+              font_stretch_percentage,
+              font_style_style,
+              &font,
+              font_size,
+              &font_family,
+              text_baseline,
+              text_align,
+              text_direction,
+              letter_spacing,
+              word_spacing,
+              shadow_paint,
+              variations,
+              font_kerning,
+              font_variant_caps,
+              &lang,
+              text_rendering,
+            )?;
+            shadow_canvas.restore();
+            Ok(())
+          },
+        )?;
+      }
+      canvas.draw_text(
+        text,
+        x,
+        y,
+        max_width,
+        width,
+        font_weight,
+        font_stretch as i32,
+        font_stretch_percentage,
+        font_style_style,
+        &font,
+        font_size,
+        &font_family,
+        text_baseline,
+        text_align,
+        text_direction,
+        letter_spacing,
+        word_spacing,
+        paint,
+        variations,
+        font_kerning,
+        font_variant_caps,
+        &lang,
+        text_rendering,
+      )?;
+      Ok(())
+    })?;
+    Ok(())
+  }
+
+  fn get_line_metrics(&mut self, text: &str) -> result::Result<LineMetrics, SkError> {
+    let state = &self.state;
+    let fill_paint = self.fill_paint()?;
+    let weight = state.font_style.weight;
+    let stretch = state.font_stretch;
+    let slant = state.font_style.style;
+    let font = get_font()?;
+    let line_metrics = LineMetrics(self.surface.canvas.get_line_metrics(
+      text,
+      &font,
+      state.font_style.size,
+      weight,
+      stretch as i32,
+      stretch.to_width_percentage(),
+      slant,
+      &state.font_style.family,
+      state.text_baseline,
+      state.text_align,
+      state.text_direction,
+      state.letter_spacing,
+      state.word_spacing,
+      &fill_paint,
+      &self.state.font_variations,
+      self.state.font_kerning,
+      self.state.font_variant_caps,
+      &self.state.lang,
+      self.state.text_rendering,
+    )?);
+    Ok(line_metrics)
+  }
+
+  fn apply_shadow_offset_matrix_to_canvas(
+    canvas: &mut Canvas,
+    shadow_offset_x: f32,
+    shadow_offset_y: f32,
+  ) -> result::Result<(), SkError> {
+    // Following CanvasKit's approach: apply shadow offset in device coordinates
+    // by inverting the current transform, applying the offset, then re-applying the transform
+    let current_transform = canvas.get_transform_matrix().clone();
+
+    // Invert the current transform to get back to device coordinates
+    if let Some(inverted) = current_transform.invert() {
+      canvas.concat(&inverted);
+      // Apply shadow offset in device coordinates
+      canvas.concat(&Matrix::translated(shadow_offset_x, shadow_offset_y));
+      // Re-apply the original transform
+      canvas.concat(&current_transform);
+    } else {
+      // If the transform is not invertible, fall back to simple translation
+      canvas.concat(&Matrix::translated(shadow_offset_x, shadow_offset_y));
+    }
+    Ok(())
+  }
+
+  // ./skia/modules/canvaskit/color.js
+  fn multiply_by_alpha(color: &RGBA<u8>, global_alpha: u8) -> RGBA<u8> {
+    let mut result = *color;
+    result.a = ((0.0_f32.max((result.a as f32 / 255.0 * (global_alpha as f32 / 255.0)).min(1.0)))
+      * 255.0)
+      .round() as u8;
+    result
+  }
+
+  // Helper function to render shadows without canvas bounds clipping
+  fn render_shadow_canvas<F>(
+    surface_canvas: &mut Canvas,
+    paint: &Paint,
+    blend_mode: BlendMode,
+    width: f32,
+    height: f32,
+    shadow_offset_x: f32,
+    shadow_offset_y: f32,
+    shadow_blur: f32,
+    f: F,
+  ) -> result::Result<(), SkError>
+  where
+    F: Fn(&mut Canvas, &Paint) -> result::Result<(), SkError>,
+  {
+    // Calculate expanded bounds to accommodate shadows
+    let shadow_expansion =
+      (shadow_blur.abs() + shadow_offset_x.abs() + shadow_offset_y.abs()).max(shadow_blur * 2.0);
+    let expanded_width = width + shadow_expansion * 2.0;
+    let expanded_height = height + shadow_expansion * 2.0;
+
+    match blend_mode {
+      BlendMode::SourceIn
+      | BlendMode::SourceOut
+      | BlendMode::DestinationIn
+      | BlendMode::DestinationOut
+      | BlendMode::DestinationATop
+      | BlendMode::Source => {
+        let mut layer_paint = paint.clone();
+        layer_paint.set_blend_mode(BlendMode::SourceOver);
+        let mut layer = PictureRecorder::new();
+        layer.begin_recording(
+          -shadow_expansion,
+          -shadow_expansion,
+          expanded_width,
+          expanded_height,
+        );
+        if let Some(canvas) = layer.get_recording_canvas() {
+          f(canvas, &layer_paint)?;
+        }
+        if let Some(pict) = layer.finish_recording_as_picture() {
+          surface_canvas.save();
+          surface_canvas.draw_picture(&pict, &Matrix::identity(), paint);
+          surface_canvas.restore();
+        }
+        Ok(())
+      }
+      _ => {
+        // For regular blend modes, temporarily disable clipping for shadows
+        surface_canvas.save();
+        // Get current transform to restore it later
+        let current_transform = surface_canvas.get_transform_matrix().clone();
+
+        // Remove any existing clip bounds temporarily
+        surface_canvas.restore();
+        surface_canvas.save();
+        surface_canvas.set_transform(&current_transform);
+
+        f(surface_canvas, paint)?;
+        surface_canvas.restore();
+        Ok(())
+      }
+    }
+  }
+
+  pub fn annotate_link_url(&self, left: f64, top: f64, right: f64, bottom: f64, url: String) {
+    self
+      .surface
+      .annotate_link_url(left as f32, top as f32, right as f32, bottom as f32, &url);
+  }
+
+  pub fn annotate_named_destination(&self, x: f64, y: f64, name: String) {
+    self
+      .surface
+      .annotate_named_destination(x as f32, y as f32, &name);
+  }
+
+  pub fn annotate_link_to_destination(
+    &self,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    name: String,
+  ) {
+    self.surface.annotate_link_to_destination(
+      left as f32,
+      top as f32,
+      right as f32,
+      bottom as f32,
+      &name,
+    );
+  }
+}
+
+#[pyclass]
+pub struct ContextAttributes {
+  #[pyo3(get)]
+  pub alpha: bool,
+  #[pyo3(get)]
+  pub desynchronized: bool,
+}
+
+#[pyclass(module = "canvas_pyr", from_py_object, eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SvgExportFlag {
+  ConvertTextToPaths = 0x01,
+  NoPrettyXML = 0x02,
+  RelativePathEncoding = 0x04,
+}
+
+impl From<SvgExportFlag> for crate::sk::SvgExportFlag {
+  fn from(value: SvgExportFlag) -> Self {
+    match value {
+      SvgExportFlag::ConvertTextToPaths => crate::sk::SvgExportFlag::ConvertTextToPaths,
+      SvgExportFlag::NoPrettyXML => crate::sk::SvgExportFlag::NoPrettyXML,
+      SvgExportFlag::RelativePathEncoding => crate::sk::SvgExportFlag::RelativePathEncoding,
+    }
+  }
+}
+
+#[pyclass(unsendable, module = "canvas_pyr")]
+pub struct CanvasRenderingContext2D {
+  pub(crate) context: Context,
+  pub fill_style_hidden: Py<PyAny>,
+  pub stroke_style_hidden: Py<PyAny>,
+  pub canvas: Option<Py<PyWeakrefReference>>,
+}
+
+#[derive(FromPyObject)]
+pub enum RuleOrPathArg<'py> {
+  A(String),
+  B(PyRefMut<'py, Path>),
+}
+
+#[pymethods]
+#[allow(non_snake_case)]
+impl CanvasRenderingContext2D {
+  #[getter]
+  pub fn get_canvas<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyAny>> {
+    if let Some(ref canvas_weak) = self.canvas {
+      canvas_weak.bind(py).upgrade()
+    } else {
+      None
+    }
+  }
+
+  #[getter(miterLimit)]
+  pub fn get_miter_limit(&self) -> f32 {
+    self.context.get_miter_limit()
+  }
+
+  #[setter(miterLimit)]
+  pub fn set_miter_limit(&mut self, miter_limit: f64) {
+    if !miter_limit.is_nan() && !miter_limit.is_infinite() {
+      self.context.set_miter_limit(miter_limit as f32);
+    }
+  }
+
+  #[getter(globalAlpha)]
+  pub fn get_global_alpha(&self) -> f64 {
+    self.context.get_global_alpha()
+  }
+
+  #[setter(globalAlpha)]
+  pub fn set_global_alpha(&mut self, alpha: f64) {
+    let alpha = alpha as f32;
+    if !(0.0..=1.0).contains(&alpha) {
+      #[cfg(debug_assertions)]
+      eprintln!("Alpha value out of range, expected 0.0 - 1.0, but got : {alpha}");
+      return;
+    }
+    self.context.state.global_alpha = alpha;
+    self.context.state.paint.set_alpha((alpha * 255.0) as u8);
+  }
+
+  #[getter(globalCompositeOperation)]
+  pub fn get_global_composite_operation(&self) -> &str {
+    self.context.state.paint.get_blend_mode().as_str()
+  }
+
+  #[setter(globalCompositeOperation)]
+  pub fn set_global_composite_operation(&mut self, mode: String) {
+    if let Ok(blend_mode) = mode.parse() {
+      self.context.state.paint.set_blend_mode(blend_mode);
+      self.context.state.global_composite_operation = blend_mode;
+    };
+  }
+
+  #[getter(imageSmoothingEnabled)]
+  pub fn get_image_smoothing_enabled(&self) -> bool {
+    self.context.state.image_smoothing_enabled
+  }
+
+  #[setter(imageSmoothingEnabled)]
+  pub fn set_image_smoothing_enabled(&mut self, enabled: bool) {
+    self.context.state.image_smoothing_enabled = enabled;
+  }
+
+  #[getter(imageSmoothingQuality)]
+  pub fn get_image_smoothing_quality(&self) -> String {
+    self
+      .context
+      .state
+      .image_smoothing_quality
+      .as_str()
+      .to_owned()
+  }
+
+  #[setter(imageSmoothingQuality)]
+  pub fn set_image_smoothing_quality(&mut self, quality: String) {
+    if let Ok(quality) = quality.parse() {
+      self.context.state.image_smoothing_quality = quality;
+    };
+  }
+
+  #[getter(lineCap)]
+  pub fn get_line_cap(&self) -> String {
+    self
+      .context
+      .state
+      .paint
+      .get_stroke_cap()
+      .as_str()
+      .to_owned()
+  }
+
+  #[setter(lineCap)]
+  pub fn set_line_cap(&mut self, cap: String) {
+    if let Ok(cap) = cap.parse() {
+      self.context.state.paint.set_stroke_cap(cap);
+    };
+  }
+
+  #[getter(lineDashOffset)]
+  pub fn get_line_dash_offset(&self) -> f64 {
+    self.context.state.line_dash_offset as f64
+  }
+
+  #[setter(lineDashOffset)]
+  pub fn set_line_dash_offset(&mut self, offset: f64) {
+    self.context.state.line_dash_offset = offset as f32;
+  }
+
+  #[getter(lineJoin)]
+  pub fn get_line_join(&self) -> String {
+    self
+      .context
+      .state
+      .paint
+      .get_stroke_join()
+      .as_str()
+      .to_owned()
+  }
+
+  #[setter(lineJoin)]
+  pub fn set_line_join(&mut self, join: String) {
+    if let Ok(join) = join.parse() {
+      self.context.state.paint.set_stroke_join(join);
+    };
+  }
+
+  #[getter(lineWidth)]
+  pub fn get_line_width(&self) -> f64 {
+    self.context.state.paint.get_stroke_width() as f64
+  }
+
+  #[setter(lineWidth)]
+  pub fn set_line_width(&mut self, width: f64) {
+    self.context.state.paint.set_stroke_width(width as f32);
+  }
+
+  #[getter(fillStyle)]
+  pub fn get_fill_style(&self, py: Python) -> Py<PyAny> {
+    self.fill_style_hidden.clone_ref(py)
+  }
+
+  #[setter(fillStyle)]
+  pub fn set_fill_style(&mut self, py: Python, fill_style: &Bound<'_, PyAny>) -> PyResult<()> {
+    let pattern = if let Ok(color) = fill_style.cast::<PyString>() {
+      Pattern::from_color(color.to_str()?).ok()
+    } else if let Ok(gradient) = fill_style.cast::<CanvasGradient>() {
+      Some(Pattern::Gradient(gradient.borrow().0.clone()))
+    } else if let Ok(pattern) = fill_style.cast::<CanvasPattern>() {
+      Some(pattern.borrow().inner.clone())
+    } else {
+      Err(PyValueError::new_err("Invalid fillStyle type"))?
+    };
+
+    if let Some(pattern) = pattern {
+      self.fill_style_hidden = fill_style.as_borrowed().as_unbound().clone_ref(py);
+      self.context.state.fill_style = pattern;
+    }
+    Ok(())
+  }
+
+  #[getter]
+  pub fn get_filter(&self) -> String {
+    self.context.state.filters_string.clone()
+  }
+
+  #[setter]
+  pub fn set_filter(&mut self, filter: String) -> PyResult<()> {
+    self.context.set_filter(&filter)?;
+    Ok(())
+  }
+
+  #[getter]
+  pub fn get_font(&self) -> String {
+    self.context.get_font().to_owned()
+  }
+
+  #[getter(fontVariationSettings)]
+  pub fn get_font_variation_settings(&self) -> String {
+    self.context.get_font_variation_settings().to_owned()
+  }
+
+  #[setter(fontVariationSettings)]
+  pub fn set_font_variation_settings(&mut self, settings: String) -> PyResult<()> {
+    self.context.set_font_variation_settings(settings)?;
+    Ok(())
+  }
+
+  #[setter]
+  pub fn set_font(&mut self, font: String) -> PyResult<()> {
+    self.context.set_font(font)?;
+    Ok(())
+  }
+
+  #[getter]
+  pub fn get_direction(&self) -> String {
+    self.context.state.text_direction.as_str().to_owned()
+  }
+
+  #[setter]
+  pub fn set_direction(&mut self, direction: String) {
+    if let Ok(d) = direction.parse() {
+      self.context.state.text_direction = d;
+    };
+  }
+
+  #[getter(letterSpacing)]
+  pub fn get_letter_spacing(&self) -> String {
+    self.context.state.letter_spacing_raw.clone()
+  }
+
+  #[setter(letterSpacing)]
+  pub fn set_letter_spacing(&mut self, spacing: String) -> PyResult<()> {
+    if let Some(size) = parse_css_size(&spacing) {
+      self.context.state.letter_spacing = size;
+      self.context.state.letter_spacing_raw = spacing;
+    }
+    Ok(())
+  }
+
+  #[getter(wordSpacing)]
+  pub fn get_word_spacing(&self) -> String {
+    self.context.state.word_spacing_raw.clone()
+  }
+
+  #[setter(wordSpacing)]
+  pub fn set_word_spacing(&mut self, spacing: String) -> PyResult<()> {
+    if let Some(size) = parse_css_size(&spacing) {
+      self.context.state.word_spacing = size;
+      self.context.state.word_spacing_raw = spacing;
+    }
+    Ok(())
+  }
+
+  #[getter(strokeStyle)]
+  pub fn get_stroke_style(&self, py: Python) -> Py<PyAny> {
+    self.stroke_style_hidden.clone_ref(py)
+  }
+
+  #[setter(strokeStyle)]
+  pub fn set_stroke_style(&mut self, py: Python, stroke_style: &Bound<'_, PyAny>) -> PyResult<()> {
+    let pattern = if let Ok(color) = stroke_style.cast::<PyString>() {
+      Pattern::from_color(color.to_str()?).ok()
+    } else if let Ok(gradient) = stroke_style.cast::<CanvasGradient>() {
+      Some(Pattern::Gradient(gradient.borrow().0.clone()))
+    } else if let Ok(pattern) = stroke_style.cast::<CanvasPattern>() {
+      Some(pattern.borrow().inner.clone())
+    } else {
+      Err(PyValueError::new_err("Invalid strokeStyle type"))?
+    };
+
+    if let Some(pattern) = pattern {
+      self.stroke_style_hidden = stroke_style.as_borrowed().as_unbound().clone_ref(py);
+      self.context.state.stroke_style = pattern;
+    }
+    Ok(())
+  }
+
+  #[getter(shadowBlur)]
+  pub fn get_shadow_blur(&self) -> f64 {
+    self.context.state.shadow_blur as f64
+  }
+
+  #[setter(shadowBlur)]
+  pub fn set_shadow_blur(&mut self, blur: f64) {
+    self.context.state.shadow_blur = blur as f32;
+  }
+
+  #[getter(shadowColor)]
+  pub fn get_shadow_color(&self) -> String {
+    self.context.state.shadow_color_string.clone()
+  }
+
+  #[setter(shadowColor)]
+  pub fn set_shadow_color(&mut self, shadow_color: String) -> PyResult<()> {
+    self.context.set_shadow_color(shadow_color)?;
+    Ok(())
+  }
+
+  #[getter(shadowOffsetX)]
+  pub fn get_shadow_offset_x(&self) -> f64 {
+    self.context.state.shadow_offset_x as f64
+  }
+
+  #[setter(shadowOffsetX)]
+  pub fn set_shadow_offset_x(&mut self, offset_x: f64) {
+    self.context.state.shadow_offset_x = offset_x as f32;
+  }
+
+  #[getter(shadowOffsetY)]
+  pub fn get_shadow_offset_y(&self) -> f64 {
+    self.context.state.shadow_offset_y as f64
+  }
+
+  #[setter(shadowOffsetY)]
+  pub fn set_shadow_offset_y(&mut self, offset_y: f64) {
+    self.context.state.shadow_offset_y = offset_y as f32;
+  }
+
+  #[getter(textAlign)]
+  pub fn get_text_align(&self) -> String {
+    self.context.state.text_align.as_str().to_owned()
+  }
+
+  #[setter(textAlign)]
+  pub fn set_text_align(&mut self, align: String) -> PyResult<()> {
+    self.context.set_text_align(align)?;
+    Ok(())
+  }
+
+  #[getter(textBaseline)]
+  pub fn get_text_baseline(&self) -> String {
+    self.context.state.text_baseline.as_str().to_owned()
+  }
+
+  #[setter(textBaseline)]
+  pub fn set_text_baseline(&mut self, baseline: String) -> PyResult<()> {
+    self.context.set_text_baseline(baseline)?;
+    Ok(())
+  }
+
+  #[getter(fontStretch)]
+  pub fn get_font_stretch(&self) -> String {
+    self.context.state.font_stretch_raw.clone()
+  }
+
+  #[setter(fontStretch)]
+  pub fn set_font_stretch(&mut self, stretch: String) -> PyResult<()> {
+    self.context.set_font_stretch(stretch)?;
+    Ok(())
+  }
+
+  #[getter(fontKerning)]
+  pub fn get_font_kerning(&self) -> String {
+    self.context.state.font_kerning.as_str().to_owned()
+  }
+
+  #[setter(fontKerning)]
+  pub fn set_font_kerning(&mut self, kerning: String) -> PyResult<()> {
+    self.context.set_font_kerning(kerning)?;
+    Ok(())
+  }
+
+  #[getter(fontVariantCaps)]
+  pub fn get_font_variant_caps(&self) -> String {
+    self.context.state.font_variant_caps.as_str().to_owned()
+  }
+
+  #[setter(fontVariantCaps)]
+  pub fn set_font_variant_caps(&mut self, variant_caps: String) -> PyResult<()> {
+    self.context.set_font_variant_caps(variant_caps)?;
+    Ok(())
+  }
+
+  #[getter(textRendering)]
+  pub fn get_text_rendering(&self) -> String {
+    self.context.state.text_rendering.as_str().to_owned()
+  }
+
+  #[setter(textRendering)]
+  pub fn set_text_rendering(&mut self, rendering: String) -> PyResult<()> {
+    self.context.set_text_rendering(rendering)?;
+    Ok(())
+  }
+
+  #[getter(lang)]
+  pub fn get_lang(&self) -> String {
+    self.context.state.lang.clone()
+  }
+
+  #[setter(lang)]
+  pub fn set_lang(&mut self, lang: String) {
+    self.context.set_lang(lang);
+  }
+
+  #[pyo3(signature = (x, y, radius, startAngle, endAngle, anticlockwise=None))]
+  pub fn arc(
+    &mut self,
+    x: f64,
+    y: f64,
+    radius: f64,
+    startAngle: f64,
+    endAngle: f64,
+    anticlockwise: Option<bool>,
+  ) {
+    self.context.arc(
+      x as f32,
+      y as f32,
+      radius as f32,
+      startAngle as f32,
+      endAngle as f32,
+      anticlockwise.unwrap_or(false),
+    );
+  }
+
+  #[pyo3(name = "arcTo")]
+  pub fn arc_to(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, radius: f64) {
+    self
+      .context
+      .arc_to(x1 as f32, y1 as f32, x2 as f32, y2 as f32, radius as f32);
+  }
+
+  #[pyo3(name = "beginPath")]
+  pub fn begin_path(&mut self) {
+    self.context.begin_path();
+  }
+
+  #[pyo3(name = "bezierCurveTo")]
+  pub fn bezier_curve_to(&mut self, cp1x: f64, cp1y: f64, cp2x: f64, cp2y: f64, x: f64, y: f64) {
+    self.context.bezier_curve_to(
+      cp1x as f32,
+      cp1y as f32,
+      cp2x as f32,
+      cp2y as f32,
+      x as f32,
+      y as f32,
+    );
+  }
+
+  #[pyo3(name = "quadraticCurveTo")]
+  pub fn quadratic_curve_to(&mut self, cpx: f64, cpy: f64, x: f64, y: f64) {
+    self
+      .context
+      .quadratic_curve_to(cpx as f32, cpy as f32, x as f32, y as f32);
+  }
+
+  #[pyo3(signature = (rule_or_path=None, maybe_rule=None))]
+  pub fn clip(&mut self, rule_or_path: Option<RuleOrPathArg>, maybe_rule: Option<String>) {
+    let rule = rule_or_path
+      .as_ref()
+      .and_then(|e| match e {
+        RuleOrPathArg::A(s) => FillType::from_str(s).ok(),
+        RuleOrPathArg::B(_) => None,
+      })
+      .or_else(|| maybe_rule.and_then(|s| FillType::from_str(&s).ok()))
+      .unwrap_or(FillType::Winding);
+    let mut path = rule_or_path.and_then(|e| match e {
+      RuleOrPathArg::A(_) => None,
+      RuleOrPathArg::B(p) => Some(p),
+    });
+    self.context.clip(path.as_mut().map(|p| &mut p.inner), rule);
+  }
+
+  #[pyo3(name = "clearRect")]
+  pub fn clear_rect(&mut self, x: f64, y: f64, width: f64, height: f64) -> PyResult<()> {
+    self
+      .context
+      .clear_rect(x as f32, y as f32, width as f32, height as f32)?;
+    Ok(())
+  }
+
+  #[pyo3(name = "closePath")]
+  pub fn close_path(&mut self) {
+    self.context.close_path();
+  }
+
+  #[pyo3(name = "createImageData", signature = (width_or_data, width_or_height=None, height_or_settings=None))]
+  pub fn create_image_data(
+    &mut self,
+    py: Python,
+    width_or_data: PyEither<u32, PyRef<ImageData>>,
+    width_or_height: Option<u32>,
+    height_or_settings: Option<PyEither<u32, Settings>>,
+  ) -> PyResult<ImageData> {
+    match width_or_data {
+      PyEither::A(width) => {
+        let height = match width_or_height {
+          Some(h) => h,
+          None => Err(PyValueError::new_err(
+            "Height must be provided when first argument is width",
+          ))?,
+        };
+        let color_space = match height_or_settings {
+          Some(PyEither::B(settings)) => {
+            ColorSpace::from_str(&settings.color_space).unwrap_or_default()
+          }
+          _ => ColorSpace::default(),
+        };
+        let instance = ImageData::new_zero(py, width, height, color_space)?;
+        Ok(instance)
+      }
+      PyEither::B(data_object) => {
+        let instance = ImageData::new_zero1(
+          py,
+          data_object.width,
+          data_object.height,
+          ColorSpace::default(),
+        )?;
+        Ok(instance)
+      }
+    }
+  }
+
+  #[pyo3(name = "createLinearGradient")]
+  pub fn create_linear_gradient(
+    &mut self,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+  ) -> PyResult<CanvasGradient> {
+    let linear_gradient =
+      Gradient::create_linear_gradient(x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+    Ok(CanvasGradient(linear_gradient))
+  }
+
+  #[pyo3(name = "createRadialGradient")]
+  pub fn create_radial_gradient(
+    &mut self,
+    x0: f64,
+    y0: f64,
+    r0: f64,
+    x1: f64,
+    y1: f64,
+    r1: f64,
+  ) -> CanvasGradient {
+    let radial_gradient = Gradient::create_radial_gradient(
+      x0 as f32, y0 as f32, r0 as f32, x1 as f32, y1 as f32, r1 as f32,
+    );
+    CanvasGradient(radial_gradient)
+  }
+
+  #[pyo3(name = "createConicGradient")]
+  pub fn create_conic_gradient(&mut self, r: f64, x: f64, y: f64) -> CanvasGradient {
+    let conic_gradient = Gradient::create_conic_gradient(x as f32, y as f32, r as f32);
+    CanvasGradient(conic_gradient)
+  }
+
+  #[pyo3(name = "createPattern")]
+  pub fn create_pattern(
+    mut self_: PyRefMut<Self>,
+    py: Python,
+    input: PyEither4<
+      PyRefMut<Image>,
+      PyRefMut<ImageData>,
+      PyRefMut<CanvasElement>,
+      PyRefMut<SVGCanvas>,
+    >,
+    repetition: Option<String>,
+  ) -> PyResult<CanvasPattern> {
+    // if input canvas or svg is the same as self, use self's context to avoid borrow conflicts, otherwise borrow from the input
+    let context = match &input {
+      PyEither4::C(canvas) => {
+        if std::ptr::eq(canvas.ctx.as_ref().as_ptr(), self_.as_ptr()) {
+          Some(&mut self_.context)
+        } else {
+          None
+        }
+      }
+      PyEither4::D(svg) => {
+        if std::ptr::eq(svg.ctx.as_ref().as_ptr(), self_.as_ptr()) {
+          Some(&mut self_.context)
+        } else {
+          None
+        }
+      }
+      _ => None,
+    };
+    CanvasPattern::new1(py, input, repetition, context)
+  }
+
+  pub fn rect(&mut self, x: f64, y: f64, width: f64, height: f64) {
+    self
+      .context
+      .rect(x as f32, y as f32, width as f32, height as f32);
+  }
+
+  #[pyo3(name = "roundRect")]
+  pub fn round_rect(
+    &mut self,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radii: PyEither3<f64, Vec<f64>, Bound<'_, PyAny>>,
+  ) {
+    // https://github.com/chromium/chromium/blob/111.0.5520.1/third_party/blink/renderer/modules/canvas/canvas2d/canvas_path.cc#L579
+    let radii_array: [f32; 4] = match radii {
+      PyEither3::A(radii) => [radii as f32; 4],
+      PyEither3::B(radii_vec) => match radii_vec.len() {
+        0 => [0f32; 4],
+        1 => [radii_vec[0] as f32; 4],
+        2 => [
+          radii_vec[0] as f32,
+          radii_vec[1] as f32,
+          radii_vec[0] as f32,
+          radii_vec[1] as f32,
+        ],
+        3 => [
+          radii_vec[0] as f32,
+          radii_vec[1] as f32,
+          radii_vec[1] as f32,
+          radii_vec[2] as f32,
+        ],
+        _ => [
+          radii_vec[0] as f32,
+          radii_vec[1] as f32,
+          radii_vec[2] as f32,
+          radii_vec[3] as f32,
+        ],
+      },
+      PyEither3::C(_) => [0f32; 4],
+    };
+    self
+      .context
+      .round_rect(x as f32, y as f32, width as f32, height as f32, radii_array);
+  }
+
+  #[pyo3(signature = (rule_or_path=None, maybe_rule=None))]
+  pub fn fill(
+    &mut self,
+    rule_or_path: Option<RuleOrPathArg>,
+    maybe_rule: Option<String>,
+  ) -> PyResult<()> {
+    let rule = rule_or_path
+      .as_ref()
+      .and_then(|e| match e {
+        RuleOrPathArg::A(s) => FillType::from_str(s).ok(),
+        RuleOrPathArg::B(_) => None,
+      })
+      .or_else(|| maybe_rule.and_then(|s| FillType::from_str(&s).ok()))
+      .unwrap_or(FillType::Winding);
+    let mut path = rule_or_path.and_then(|e| match e {
+      RuleOrPathArg::A(_) => None,
+      RuleOrPathArg::B(p) => Some(p),
+    });
+    self
+      .context
+      .fill(path.as_mut().map(|p| &mut p.inner), rule)?;
+    Ok(())
+  }
+
+  pub fn save(&mut self) {
+    self.context.save();
+  }
+
+  pub fn restore(&mut self) {
+    self.context.restore();
+  }
+
+  #[pyo3(name = "reset")]
+  pub fn reset(&mut self, py: Python) -> PyResult<()> {
+    self.context.reset();
+    // Reset the hidden fill/stroke style properties to default "#000000"
+    let default_style = PyString::intern(py, "#000000").into_any().unbind();
+    self.fill_style_hidden = default_style.clone_ref(py);
+    self.stroke_style_hidden = default_style.clone_ref(py);
+    Ok(())
+  }
+
+  pub fn rotate(&mut self, angle: f64) {
+    self.context.rotate(angle as f32);
+  }
+
+  pub fn scale(&mut self, x: f64, y: f64) {
+    self.context.scale(x as f32, y as f32);
+  }
+
+  #[pyo3(name = "drawImage", signature=(image, sx, sy, s_width=None, s_height=None, dx=None, dy=None, d_width=None, d_height=None, /))]
+  pub fn draw_image(
+    &mut self,
+    py: Python,
+    mut image: PyEither3<PyRefMut<CanvasElement>, PyRefMut<SVGCanvas>, PyRefMut<Image>>,
+    sx: Option<f64>,
+    sy: Option<f64>,
+    s_width: Option<f64>,
+    s_height: Option<f64>,
+    dx: Option<f64>,
+    dy: Option<f64>,
+    d_width: Option<f64>,
+    d_height: Option<f64>,
+  ) -> PyResult<()> {
+    let bitmap = match &mut image {
+      PyEither3::A(canvas) => {
+        let mut ctx = canvas.ctx.borrow_mut(py);
+        // Flush the source canvas to render deferred operations before getting bitmap
+        ctx.context.flush();
+        BitmapRef::Owned(ctx.context.surface.get_bitmap())
+      }
+      PyEither3::B(svg) => BitmapRef::Owned(svg.ctx.borrow(py).context.surface.get_bitmap()),
+      PyEither3::C(image) => {
+        if !image.complete {
+          return Ok(());
+        }
+        image.regenerate_bitmap_if_need()?;
+        if let Some(bitmap) = &mut image.bitmap {
+          BitmapRef::Borrowed(bitmap)
+        } else {
+          return Ok(());
+        }
+      }
+    };
+    let bitmap_ref = bitmap.as_ref();
+    let (sx, sy, s_width, s_height, dx, dy, d_width, d_height) =
+      match (sx, sy, s_width, s_height, dx, dy, d_width, d_height) {
+        (Some(dx), Some(dy), None, None, None, None, None, None) => (
+          0.0,
+          0.0,
+          bitmap_ref.0.width as f32,
+          bitmap_ref.0.height as f32,
+          dx as f32,
+          dy as f32,
+          bitmap_ref.0.width as f32,
+          bitmap_ref.0.height as f32,
+        ),
+        (Some(dx), Some(dy), Some(d_width), Some(d_height), None, None, None, None) => (
+          0.0,
+          0.0,
+          bitmap_ref.0.width as f32,
+          bitmap_ref.0.height as f32,
+          dx as f32,
+          dy as f32,
+          d_width as f32,
+          d_height as f32,
+        ),
+        (
+          Some(sx),
+          Some(sy),
+          Some(s_width),
+          Some(s_height),
+          Some(dx),
+          Some(dy),
+          Some(d_width),
+          Some(d_height),
+        ) => (
+          sx as f32,
+          sy as f32,
+          s_width as f32,
+          s_height as f32,
+          dx as f32,
+          dy as f32,
+          d_width as f32,
+          d_height as f32,
+        ),
+        _ => return Ok(()),
+      };
+    self.context.draw_image(
+      bitmap_ref, sx, sy, s_width, s_height, dx, dy, d_width, d_height,
+    )?;
+    Ok(())
+  }
+
+  /// Draw another canvas, preserving vector graphics when possible.
+  /// When the source canvas has recorded operations, this preserves the SkPicture
+  /// representation without rasterization. Falls back to bitmap if no picture available.
+  #[pyo3(name = "drawCanvas", signature=(canvas, sx, sy, s_width=None, s_height=None, dx=None, dy=None, d_width=None, d_height=None, /))]
+  pub fn draw_canvas(
+    &mut self,
+    py: Python,
+    canvas: &mut CanvasElement,
+    sx: Option<f64>,
+    sy: Option<f64>,
+    s_width: Option<f64>,
+    s_height: Option<f64>,
+    dx: Option<f64>,
+    dy: Option<f64>,
+    d_width: Option<f64>,
+    d_height: Option<f64>,
+  ) -> PyResult<()> {
+    let source_width = canvas.width as f32;
+    let source_height = canvas.height as f32;
+
+    // Get picture from source canvas (preserves vector graphics)
+    // Note: We need mutable access to the source context to get the picture
+    // This is safe because we have exclusive access to the CanvasElement
+    let picture = canvas.ctx.borrow_mut(py).context.get_picture();
+
+    let picture = if let Some(pic) = picture {
+      pic
+    } else {
+      // Fallback to bitmap if picture not available (e.g., SVG canvas or no deferred rendering)
+      let bitmap = canvas.ctx.borrow(py).context.surface.get_bitmap();
+      let (sx, sy, s_width, s_height, dx, dy, d_width, d_height) =
+        match (sx, sy, s_width, s_height, dx, dy, d_width, d_height) {
+          (Some(dx), Some(dy), None, None, None, None, None, None) => (
+            0.0,
+            0.0,
+            source_width,
+            source_height,
+            dx as f32,
+            dy as f32,
+            source_width,
+            source_height,
+          ),
+          (Some(dx), Some(dy), Some(d_width), Some(d_height), None, None, None, None) => (
+            0.0,
+            0.0,
+            source_width,
+            source_height,
+            dx as f32,
+            dy as f32,
+            d_width as f32,
+            d_height as f32,
+          ),
+          (
+            Some(sx),
+            Some(sy),
+            Some(s_width),
+            Some(s_height),
+            Some(dx),
+            Some(dy),
+            Some(d_width),
+            Some(d_height),
+          ) => (
+            sx as f32,
+            sy as f32,
+            s_width as f32,
+            s_height as f32,
+            dx as f32,
+            dy as f32,
+            d_width as f32,
+            d_height as f32,
+          ),
+          _ => return Ok(()),
+        };
+      return self.context.draw_image(
+        &bitmap, sx, sy, s_width, s_height, dx, dy, d_width, d_height,
+      );
+    };
+
+    // Parse parameters similar to drawImage
+    let (sx, sy, s_width, s_height, dx, dy, d_width, d_height) =
+      match (sx, sy, s_width, s_height, dx, dy, d_width, d_height) {
+        (Some(dx), Some(dy), None, None, None, None, None, None) => (
+          0.0,
+          0.0,
+          source_width,
+          source_height,
+          dx as f32,
+          dy as f32,
+          source_width,
+          source_height,
+        ),
+        (Some(dx), Some(dy), Some(d_width), Some(d_height), None, None, None, None) => (
+          0.0,
+          0.0,
+          source_width,
+          source_height,
+          dx as f32,
+          dy as f32,
+          d_width as f32,
+          d_height as f32,
+        ),
+        (
+          Some(sx),
+          Some(sy),
+          Some(s_width),
+          Some(s_height),
+          Some(dx),
+          Some(dy),
+          Some(d_width),
+          Some(d_height),
+        ) => (
+          sx as f32,
+          sy as f32,
+          s_width as f32,
+          s_height as f32,
+          dx as f32,
+          dy as f32,
+          d_width as f32,
+          d_height as f32,
+        ),
+        _ => return Ok(()),
+      };
+
+    self.context.draw_canvas(
+      &picture, sx, sy, s_width, s_height, dx, dy, d_width, d_height,
+    )?;
+    Ok(())
+  }
+
+  #[pyo3(name = "getContextAttributes")]
+  pub fn get_context_attributes(&self) -> ContextAttributes {
+    ContextAttributes {
+      alpha: self.context.alpha,
+      desynchronized: false,
+    }
+  }
+
+  #[pyo3(name = "isPointInPath", signature=(x_or_path, x_or_y, y_or_fill_rule=None, maybe_fill_rule=None, /))]
+  pub fn is_point_in_path(
+    &self,
+    x_or_path: PyEither<f64, PyRef<Path>>,
+    x_or_y: f64,
+    y_or_fill_rule: Option<PyEither<f64, String>>,
+    maybe_fill_rule: Option<String>,
+  ) -> PyResult<bool> {
+    let inverted = self.context.state.transform.invert();
+    match x_or_path {
+      PyEither::A(x) => {
+        let mut x = x as f32;
+        let mut y = x_or_y as f32;
+        let fill_rule = y_or_fill_rule
+          .and_then(|v| match v {
+            PyEither::B(rule) => rule.parse().ok(),
+            _ => None,
+          })
+          .unwrap_or(FillType::Winding);
+        if let Some(inverted) = inverted {
+          let (mapped_x, mapped_y) = inverted.map_points(x, y);
+          x = mapped_x;
+          y = mapped_y;
+        }
+        Ok(self.context.path.hit_test(x, y, fill_rule))
+      }
+      PyEither::B(path) => {
+        let mut x = x_or_y as f32;
+        let mut y = match y_or_fill_rule {
+          Some(PyEither::A(y)) => y as f32,
+          _ => {
+            return Err(PyValueError::new_err(
+              "The y-axis coordinate of the point to check is missing",
+            ));
+          }
+        };
+        let fill_rule = maybe_fill_rule
+          .and_then(|s| s.parse().ok())
+          .unwrap_or(FillType::Winding);
+        if let Some(inverted) = inverted {
+          let (mapped_x, mapped_y) = inverted.map_points(x, y);
+          x = mapped_x;
+          y = mapped_y;
+        }
+        Ok(path.inner.hit_test(x, y, fill_rule))
+      }
+    }
+  }
+
+  #[pyo3(name = "isPointInStroke", signature=(x_or_path, x_or_y, maybe_y=None))]
+  pub fn is_point_in_stroke(
+    &self,
+    x_or_path: PyEither<f64, PyRef<Path>>,
+    x_or_y: f64,
+    maybe_y: Option<f64>,
+  ) -> PyResult<bool> {
+    let stroke_w = self.context.get_stroke_width();
+    let inverted = self.context.state.transform.invert();
+    match x_or_path {
+      PyEither::A(x) => {
+        let mut x = x as f32;
+        let mut y = x_or_y as f32;
+        if let Some(inverted) = inverted {
+          let (mapped_x, mapped_y) = inverted.map_points(x, y);
+          x = mapped_x;
+          y = mapped_y;
+        }
+        Ok(self.context.path.stroke_hit_test(x, y, stroke_w))
+      }
+      PyEither::B(path) => {
+        let mut x = x_or_y as f32;
+        if let Some(y) = maybe_y {
+          let mut y = y as f32;
+          if let Some(inverted) = inverted {
+            let (mapped_x, mapped_y) = inverted.map_points(x, y);
+            x = mapped_x;
+            y = mapped_y;
+          }
+          Ok(path.inner.stroke_hit_test(x, y, stroke_w))
+        } else {
+          Err(PyValueError::new_err(
+            "The y-axis coordinate of the point to check is missing",
+          ))
+        }
+      }
+    }
+  }
+
+  #[pyo3(signature = (x, y, radiusX, radiusY, rotation, startAngle, endAngle, anticlockwise=None))]
+  pub fn ellipse(
+    &mut self,
+    x: f64,
+    y: f64,
+    radiusX: f64,
+    radiusY: f64,
+    rotation: f64,
+    startAngle: f64,
+    endAngle: f64,
+    anticlockwise: Option<bool>,
+  ) {
+    self.context.ellipse(
+      x as f32,
+      y as f32,
+      radiusX as f32,
+      radiusY as f32,
+      rotation as f32,
+      startAngle as f32,
+      endAngle as f32,
+      anticlockwise.unwrap_or(false),
+    );
+  }
+
+  #[pyo3(name = "lineTo")]
+  pub fn line_to(&mut self, x: f64, y: f64) {
+    if !x.is_nan() && !x.is_infinite() && !y.is_nan() && !y.is_infinite() {
+      self.context.path.line_to(x as f32, y as f32);
+    }
+  }
+
+  #[pyo3(name = "measureText")]
+  pub fn measure_text(&mut self, text: String) -> PyResult<TextMetrics> {
+    if text.is_empty() {
+      return Ok(TextMetrics {
+        actual_bounding_box_ascent: 0.0,
+        actual_bounding_box_descent: 0.0,
+        actual_bounding_box_left: 0.0,
+        actual_bounding_box_right: 0.0,
+        font_bounding_box_ascent: 0.0,
+        font_bounding_box_descent: 0.0,
+        alphabetic_baseline: 0.0,
+        em_height_ascent: 0.0,
+        em_height_descent: 0.0,
+        width: 0.0,
+      });
+    }
+    let metrics = self.context.get_line_metrics(&text)?;
+    Ok(TextMetrics {
+      actual_bounding_box_ascent: metrics.0.ascent as f64,
+      actual_bounding_box_descent: metrics.0.descent as f64,
+      actual_bounding_box_left: metrics.0.left as f64,
+      actual_bounding_box_right: metrics.0.right as f64,
+      font_bounding_box_ascent: metrics.0.font_ascent as f64,
+      font_bounding_box_descent: metrics.0.font_descent as f64,
+      alphabetic_baseline: metrics.0.alphabetic_baseline as f64,
+      em_height_ascent: metrics.0.font_ascent as f64,
+      em_height_descent: metrics.0.font_descent as f64,
+      width: metrics.0.width as f64,
+    })
+  }
+
+  #[pyo3(name = "moveTo")]
+  pub fn move_to(&mut self, x: f64, y: f64) {
+    if !x.is_nan() && !x.is_infinite() && !y.is_nan() && !y.is_infinite() {
+      self.context.path.move_to(x as f32, y as f32);
+    }
+  }
+
+  #[pyo3(name = "fillRect")]
+  pub fn fill_rect(&mut self, x: f64, y: f64, width: f64, height: f64) -> PyResult<()> {
+    if !x.is_nan()
+      && !x.is_infinite()
+      && !y.is_nan()
+      && !y.is_infinite()
+      && !width.is_nan()
+      && !width.is_infinite()
+      && !height.is_nan()
+      && !height.is_infinite()
+    {
+      self
+        .context
+        .fill_rect(x as f32, y as f32, width as f32, height as f32)?;
+    }
+    Ok(())
+  }
+
+  #[pyo3(name = "fillText", signature=(text, x, y, maxWidth=None))]
+  pub fn fill_text(&mut self, text: &str, x: f64, y: f64, maxWidth: Option<f64>) -> PyResult<()> {
+    if text.is_empty() {
+      return Ok(());
+    }
+    if !x.is_nan() && !x.is_infinite() && !y.is_nan() && !y.is_infinite() {
+      self.context.fill_text(
+        text,
+        x as f32,
+        y as f32,
+        maxWidth.map(|f| f as f32).unwrap_or(MAX_TEXT_WIDTH),
+      )?;
+    }
+    Ok(())
+  }
+
+  #[pyo3(name = "stroke", signature = (path=None))]
+  pub fn stroke(&mut self, path: Option<PyRefMut<Path>>) -> PyResult<()> {
+    let mut path = path;
+    let path_ref = path.as_deref_mut().map(|p| &mut p.inner);
+    self.context.stroke(path_ref)?;
+    Ok(())
+  }
+
+  #[pyo3(name = "strokeRect")]
+  pub fn stroke_rect(&mut self, x: f64, y: f64, width: f64, height: f64) -> PyResult<()> {
+    if !x.is_nan()
+      && !x.is_infinite()
+      && !y.is_nan()
+      && !y.is_infinite()
+      && !width.is_nan()
+      && !width.is_infinite()
+      && !height.is_nan()
+      && !height.is_infinite()
+    {
+      self
+        .context
+        .stroke_rect(x as f32, y as f32, width as f32, height as f32)?;
+    }
+    Ok(())
+  }
+
+  #[pyo3(name = "strokeText", signature=(text, x, y, maxWidth=None))]
+  pub fn stroke_text(&mut self, text: &str, x: f64, y: f64, maxWidth: Option<f64>) -> PyResult<()> {
+    if text.is_empty() {
+      return Ok(());
+    }
+    if !x.is_nan() && !x.is_infinite() && !y.is_nan() && !y.is_infinite() {
+      self.context.stroke_text(
+        text,
+        x as f32,
+        y as f32,
+        maxWidth.map(|v| v as f32).unwrap_or(MAX_TEXT_WIDTH),
+      )?;
+    }
+    Ok(())
+  }
+
+  #[pyo3(name = "getImageData", signature = (x, y, width, height, colorSpace=None))]
+  pub fn get_image_data(
+    &mut self,
+    py: Python,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    colorSpace: Option<String>,
+  ) -> PyResult<ImageData> {
+    if !x.is_nan()
+      && !x.is_infinite()
+      && !y.is_nan()
+      && !y.is_infinite()
+      && !width.is_nan()
+      && !width.is_infinite()
+      && !height.is_nan()
+      && !height.is_infinite()
+    {
+      let color_space = colorSpace
+        .and_then(|cs| cs.parse().ok())
+        .unwrap_or(ColorSpace::Srgb);
+      let image_data = self
+        .context
+        .get_image_data(x as f32, y as f32, width as f32, height as f32, color_space)
+        .ok_or_else(|| PyRuntimeError::new_err("Read pixels from canvas failed"))?;
+      let instance = ImageData::new_with_data(
+        py,
+        width as u32,
+        height as u32,
+        color_space,
+        |bytes: &mut [u8]| {
+          bytes.copy_from_slice(image_data.as_ref());
+          Ok(())
+        },
+      )?;
+      Ok(instance)
+    } else {
+      Err(PyValueError::new_err(
+        "The x, y, width, and height arguments must be finite numbers",
+      ))
+    }
+  }
+
+  #[pyo3(name = "getLineDash")]
+  pub fn get_line_dash(&self) -> Vec<f64> {
+    self
+      .context
+      .state
+      .line_dash_list
+      .iter()
+      .map(|l| *l as f64)
+      .collect()
+  }
+
+  #[pyo3(name = "putImageData", signature = (imageData, dx, dy, dirtyX=None, dirtyY=None, dirtyWidth=None, dirtyHeight=None))]
+  pub fn put_image_data(
+    &mut self,
+    imageData: &ImageData,
+    dx: u32,
+    dy: u32,
+    dirtyX: Option<f64>,
+    dirtyY: Option<f64>,
+    dirtyWidth: Option<f64>,
+    dirtyHeight: Option<f64>,
+  ) {
+    if let Some(dirtyX) = dirtyX {
+      let mut dirtyX = dirtyX as f32;
+      let mut dirtyY = dirtyY.map(|d| d as f32).unwrap_or(0.0);
+      let mut dirtyWidth = dirtyWidth
+        .map(|d| d as f32)
+        .unwrap_or(imageData.width as f32);
+      let mut dirtyHeight = dirtyHeight
+        .map(|d| d as f32)
+        .unwrap_or(imageData.height as f32);
+      // as per https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-putimagedata
+      if dirtyWidth < 0f32 {
+        dirtyX += dirtyWidth;
+        dirtyWidth = dirtyWidth.abs();
+      }
+      if dirtyHeight < 0f32 {
+        dirtyY += dirtyHeight;
+        dirtyHeight = dirtyHeight.abs();
+      }
+      if dirtyX < 0f32 {
+        dirtyWidth += dirtyX;
+        dirtyX = 0f32;
+      }
+      if dirtyY < 0f32 {
+        dirtyHeight += dirtyY;
+        dirtyY = 0f32;
+      }
+      if dirtyWidth <= 0f32 || dirtyHeight <= 0f32 {
+        return;
+      }
+      let inverted = self.context.surface.canvas.get_transform_matrix().invert();
+      self.context.surface.canvas.save();
+      if let Some(inverted) = inverted {
+        self.context.surface.canvas.concat(&inverted);
+      };
+      self.context.surface.canvas.write_pixels_dirty(
+        imageData,
+        dx as f32,
+        dy as f32,
+        dirtyX,
+        dirtyY,
+        dirtyWidth,
+        dirtyHeight,
+        imageData.color_space,
+      );
+      self.context.surface.canvas.restore();
+    } else {
+      self.context.surface.canvas.write_pixels(imageData, dx, dy);
+    }
+  }
+
+  #[pyo3(name = "setLineDash")]
+  pub fn set_line_dash(&mut self, segments: Vec<f64>) {
+    let len = segments.len();
+    let is_odd = len & 1 != 0;
+    let mut line_dash_list = if is_odd {
+      vec![0f32; len * 2]
+    } else {
+      vec![0f32; len]
+    };
+    for (idx, dash) in segments.iter().enumerate() {
+      line_dash_list[idx] = *dash as f32;
+      if is_odd {
+        line_dash_list[idx + len] = *dash as f32;
+      }
+    }
+    self.context.set_line_dash(line_dash_list);
+  }
+
+  #[pyo3(name = "resetTransform")]
+  pub fn reset_transform(&mut self) {
+    self.context.reset_transform();
+  }
+
+  #[pyo3(name = "translate")]
+  pub fn translate(&mut self, x: f64, y: f64) {
+    self.context.translate(x as f32, y as f32);
+  }
+
+  #[pyo3(name = "transform")]
+  pub fn transform(&mut self, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> PyResult<()> {
+    let ts = Matrix::new(a as f32, c as f32, e as f32, b as f32, d as f32, f as f32);
+    self.context.transform(ts)?;
+    Ok(())
+  }
+
+  #[pyo3(name = "getTransform")]
+  pub fn get_transform(&self) -> DOMMatrix {
+    self.context.state.transform.get_transform().into()
+  }
+
+  #[pyo3(name = "setTransform", signature=(a_or_transform, b=None, c=None, d=None, e=None, f=None))]
+  pub fn set_transform(
+    &mut self,
+    a_or_transform: PyEither3<f64, TransformObject, PyRef<DOMMatrix>>,
+    b: Option<f64>,
+    c: Option<f64>,
+    d: Option<f64>,
+    e: Option<f64>,
+    f: Option<f64>,
+  ) -> Option<()> {
+    let ts = match a_or_transform {
+      PyEither3::A(a) => Transform::new(
+        a as f32, c? as f32, e? as f32, b? as f32, d? as f32, f? as f32,
+      ),
+      PyEither3::B(transform) => transform.into_context_transform(),
+      PyEither3::C(transform) => transform.xinto_context_transform(),
+    };
+    self
+      .context
+      .set_transform(Matrix::new(ts.a, ts.b, ts.c, ts.d, ts.e, ts.f));
+    None
+  }
+
+  /// Annotate a rectangular region with a clickable URL link (for PDF documents)
+  #[pyo3(name = "annotateLinkUrl")]
+  pub fn annotate_link_url(&self, left: f64, top: f64, right: f64, bottom: f64, url: String) {
+    self
+      .context
+      .annotate_link_url(left, top, right, bottom, url);
+  }
+
+  /// Create a named destination at a specific point (for PDF documents)
+  #[pyo3(name = "annotateNamedDestination")]
+  pub fn annotate_named_destination(&self, x: f64, y: f64, name: String) {
+    self.context.annotate_named_destination(x, y, name);
+  }
+
+  /// Annotate a rectangular region with a link to a named destination (for PDF documents)
+  #[pyo3(name = "annotateLinkToDestination")]
+  pub fn annotate_link_to_destination(
+    &self,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    name: String,
+  ) {
+    self
+      .context
+      .annotate_link_to_destination(left, top, right, bottom, name);
+  }
+}
+
+enum BitmapRef<'a> {
+  Borrowed(&'a mut Bitmap),
+  Owned(Bitmap),
+}
+
+impl AsRef<Bitmap> for BitmapRef<'_> {
+  fn as_ref(&self) -> &Bitmap {
+    match self {
+      BitmapRef::Borrowed(bitmap) => bitmap,
+      BitmapRef::Owned(bitmap) => bitmap,
+    }
+  }
+}
+
+#[pyclass(rename_all = "camelCase", get_all, module = "canvas_pyr")]
+pub struct TextMetrics {
+  pub actual_bounding_box_ascent: f64,
+  pub actual_bounding_box_descent: f64,
+  pub actual_bounding_box_left: f64,
+  pub actual_bounding_box_right: f64,
+  pub font_bounding_box_ascent: f64,
+  pub font_bounding_box_descent: f64,
+  pub alphabetic_baseline: f64,
+  pub em_height_ascent: f64,
+  pub em_height_descent: f64,
+  pub width: f64,
+}
+
+#[pymethods]
+impl TextMetrics {
+  #[pyo3(name = "to_dict")]
+  pub fn _to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("actualBoundingBoxAscent", self.actual_bounding_box_ascent)?;
+    dict.set_item("actualBoundingBoxDescent", self.actual_bounding_box_descent)?;
+    dict.set_item("actualBoundingBoxLeft", self.actual_bounding_box_left)?;
+    dict.set_item("actualBoundingBoxRight", self.actual_bounding_box_right)?;
+    dict.set_item("fontBoundingBoxAscent", self.font_bounding_box_ascent)?;
+    dict.set_item("fontBoundingBoxDescent", self.font_bounding_box_descent)?;
+    dict.set_item("alphabeticBaseline", self.alphabetic_baseline)?;
+    dict.set_item("emHeightAscent", self.em_height_ascent)?;
+    dict.set_item("emHeightDescent", self.em_height_descent)?;
+    dict.set_item("width", self.width)?;
+    Ok(dict.into())
+  }
+}
+
+#[derive(FromPyObject, IntoPyObject)]
+#[pyo3(from_item_all)]
+pub struct TransformObject {
+  pub a: f64,
+  pub b: f64,
+  pub c: f64,
+  pub d: f64,
+  pub e: f64,
+  pub f: f64,
+}
+
+impl TransformObject {
+  pub(crate) fn into_context_transform(self) -> Transform {
+    Transform::new(
+      self.a as f32,
+      self.c as f32,
+      self.e as f32,
+      self.b as f32,
+      self.d as f32,
+      self.f as f32,
+    )
+  }
+}
+
+impl From<TransformObject> for Transform {
+  fn from(value: TransformObject) -> Self {
+    Self::new(
+      value.a as f32,
+      value.b as f32,
+      value.c as f32,
+      value.d as f32,
+      value.e as f32,
+      value.f as f32,
+    )
+  }
+}
+
+impl From<Transform> for TransformObject {
+  fn from(value: Transform) -> Self {
+    Self {
+      a: value.a as f64,
+      b: value.b as f64,
+      c: value.c as f64,
+      d: value.d as f64,
+      e: value.e as f64,
+      f: value.f as f64,
+    }
+  }
+}
+
+pub enum ContextData {
+  Png(SurfaceRef),
+  Jpeg(SurfaceRef, u8),
+  Webp(SurfaceRef, u8),
+  Avif(SurfaceRef, Config, u32, u32),
+  Gif(SurfaceRef, GifConfig, u32, u32),
+}
+
+pub enum ContextOutputData {
+  Skia(SkiaDataRef),
+  Avif(AvifData<'static>),
+  Gif(Vec<u8>),
+}
+
+impl ContextOutputData {
+  pub(crate) fn into_bytes<'py>(self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    match self {
+      ContextOutputData::Skia(output) => unsafe {
+        PyBytes::from_ptr(py, output.0.ptr, output.0.size)
+      },
+      ContextOutputData::Avif(output) => unsafe {
+        PyBytes::from_ptr(py, output.as_ptr().cast_mut(), output.len())
+      },
+      ContextOutputData::Gif(output) => unsafe {
+        PyBytes::from_ptr(py, output.as_ptr().cast_mut(), output.len())
+      },
+    }
+  }
+}
+
+#[inline]
+pub(crate) fn encode_surface(data: &ContextData) -> PyResult<ContextOutputData> {
+  match data {
+    ContextData::Png(surface) => surface
+      .png_data()
+      .map(ContextOutputData::Skia)
+      .ok_or_else(|| PyRuntimeError::new_err("Get png data from surface failed")),
+    ContextData::Jpeg(surface, quality) => surface
+      .encode_data(SkEncodedImageFormat::Jpeg, *quality)
+      .map(ContextOutputData::Skia)
+      .ok_or_else(|| PyRuntimeError::new_err("Get jpeg data from surface failed")),
+    ContextData::Webp(surface, quality) => surface
+      .encode_data(SkEncodedImageFormat::Webp, *quality)
+      .map(ContextOutputData::Skia)
+      .ok_or_else(|| PyRuntimeError::new_err("Get webp data from surface failed")),
+    ContextData::Avif(surface, config, width, height) => surface
+      .data()
+      .ok_or_else(|| PyRuntimeError::new_err("Get avif data from surface failed"))
+      .and_then(|(data, size)| {
+        crate::avif::encode(
+          unsafe { slice::from_raw_parts(data, size) },
+          *width,
+          *height,
+          config,
+        )
+        .map(ContextOutputData::Avif)
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))
+      }),
+    ContextData::Gif(surface, config, width, height) => {
+      crate::gif::encode_surface(surface, *width, *height, config)
+        .map(ContextOutputData::Gif)
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))
+    }
+  }
+}
+
+unsafe impl Send for ContextOutputData {}
+unsafe impl Sync for ContextOutputData {}
+
+// impl Task for ContextData {
+//     type Output = ContextOutputData;
+//     type JsValue = Buffer;
+
+//     fn compute(&mut self) -> PyResult<Self::Output> {
+//         encode_surface(self)
+//     }
+
+//     fn resolve(&mut self, env: Env, output_data: Self::Output) -> PyResult<Self::JsValue> {
+//         output_data
+//             .into_buffer_slice(env)
+//             .and_then(|slice| slice.into_buffer(&env))
+//     }
+// }
+
+fn parse_css_size(css_size: &str) -> Option<f32> {
+  if css_size.ends_with('%') {
+    return css_size
+      .parse::<f32>()
+      .map(|v| v / 100.0 * FONT_MEDIUM_PX)
+      .ok();
+  } else if let Some(captures) = CSS_SIZE_REGEXP.captures(css_size) {
+    return captures.get(1).and_then(|size| {
+      captures.get(2).and_then(|unit| {
+        Some(parse_size_px(
+          size.as_str().parse::<f32>().ok()?,
+          unit.as_str(),
+        ))
+      })
+    });
+  }
+  None
+}
+
+fn parse_font_variation_settings(settings: &str) -> (String, Vec<crate::sk::FontVariation>) {
+  let trimmed = settings.trim();
+  if trimmed.eq_ignore_ascii_case("normal") || trimmed.is_empty() {
+    return ("normal".to_owned(), vec![]);
+  }
+
+  let mut variations: Vec<crate::sk::FontVariation> = Vec::new();
+  let mut valid = true;
+
+  for part in trimmed.split(',') {
+    let part = part.trim();
+    if part.is_empty() {
+      continue;
+    }
+
+    let mut chars = part.chars();
+    let first = chars.next();
+    let quote = match first {
+      Some('\'') => '\'',
+      Some('"') => '"',
+      _ => {
+        valid = false;
+        break;
+      }
+    };
+
+    let mut tag_str = String::new();
+    let mut closed = false;
+    for c in chars.by_ref() {
+      if c == quote {
+        closed = true;
+        break;
+      }
+      tag_str.push(c);
+    }
+
+    if !closed || tag_str.len() != 4 || !tag_str.is_ascii() {
+      valid = false;
+      break;
+    }
+
+    let rest: String = chars.collect();
+    let val_str = rest.trim();
+    let val = match val_str.parse::<f32>() {
+      Ok(v) => v,
+      Err(_) => {
+        valid = false;
+        break;
+      }
+    };
+
+    let bytes = tag_str.as_bytes();
+    let tag = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
+    if let Some(existing) = variations.iter_mut().find(|v| v.tag == tag) {
+      existing.value = val;
+    } else {
+      variations.push(crate::sk::FontVariation { tag, value: val });
+    }
+  }
+
+  if !valid {
+    return (settings.to_owned(), vec![]);
+  }
+
+  (settings.to_owned(), variations)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_parse_font_variation_settings_normal() {
+    let (settings, variations) = parse_font_variation_settings("normal");
+    assert_eq!(settings, "normal");
+    assert!(variations.is_empty());
+
+    let (settings, variations) = parse_font_variation_settings("NORMAL");
+    assert_eq!(settings, "normal");
+    assert!(variations.is_empty());
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_single() {
+    let (settings, variations) = parse_font_variation_settings("'wght' 700");
+    assert_eq!(settings, "'wght' 700");
+    assert_eq!(variations.len(), 1);
+    assert_eq!(variations[0].tag, 0x77676874); // 'wght'
+    assert_eq!(variations[0].value, 700.0);
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_multiple() {
+    let (settings, variations) = parse_font_variation_settings("'wght' 700, 'wdth' 50");
+    assert_eq!(settings, "'wght' 700, 'wdth' 50");
+    assert_eq!(variations.len(), 2);
+    assert_eq!(variations[0].tag, 0x77676874); // 'wght'
+    assert_eq!(variations[0].value, 700.0);
+    assert_eq!(variations[1].tag, 0x77647468); // 'wdth'
+    assert_eq!(variations[1].value, 50.0);
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_double_quotes() {
+    let (settings, variations) = parse_font_variation_settings("\"wght\" 700");
+    assert_eq!(settings, "\"wght\" 700");
+    assert_eq!(variations.len(), 1);
+    assert_eq!(variations[0].tag, 0x77676874); // 'wght'
+    assert_eq!(variations[0].value, 700.0);
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_whitespace() {
+    let (settings, variations) = parse_font_variation_settings("  'wght'  700  ,  'wdth'  50  ");
+    assert_eq!(settings, "  'wght'  700  ,  'wdth'  50  ");
+    assert_eq!(variations.len(), 2);
+    assert_eq!(variations[0].tag, 0x77676874);
+    assert_eq!(variations[0].value, 700.0);
+    assert_eq!(variations[1].tag, 0x77647468);
+    assert_eq!(variations[1].value, 50.0);
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_invalid() {
+    let (settings, variations) = parse_font_variation_settings("invalid");
+    assert_eq!(settings, "invalid");
+    assert!(variations.is_empty());
+
+    let (settings, variations) = parse_font_variation_settings("'inv' 100"); // Tag too short
+    assert_eq!(settings, "'inv' 100");
+    assert!(variations.is_empty());
+
+    let (settings, variations) = parse_font_variation_settings("'wght' 100, invalid"); // One invalid part
+    assert_eq!(settings, "'wght' 100, invalid");
+    assert!(variations.is_empty()); // Should fail completely
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_repeated() {
+    let (settings, variations) = parse_font_variation_settings("'wght' 100, 'wght' 200");
+    assert_eq!(settings, "'wght' 100, 'wght' 200");
+    assert_eq!(variations.len(), 1); // Deduplicated
+    assert_eq!(variations[0].tag, 0x77676874);
+    assert_eq!(variations[0].value, 200.0); // Last wins
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_unknown_tag() {
+    let (settings, variations) = parse_font_variation_settings("'abcd' 123");
+    assert_eq!(settings, "'abcd' 123");
+    assert_eq!(variations.len(), 1);
+    assert_eq!(variations[0].tag, 0x61626364); // 'abcd'
+    assert_eq!(variations[0].value, 123.0);
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_numeric() {
+    let (settings, variations) = parse_font_variation_settings("'wght' 123.45, 'slnt' -10");
+    assert_eq!(settings, "'wght' 123.45, 'slnt' -10");
+    assert_eq!(variations.len(), 2);
+    assert_eq!(variations[0].value, 123.45);
+    assert_eq!(variations[1].value, -10.0);
+  }
+
+  #[test]
+  fn test_parse_font_variation_settings_complex_quoting() {
+    let (settings, variations) = parse_font_variation_settings(r#"'wght' 400, "wdth" 50"#);
+    assert_eq!(settings, r#"'wght' 400, "wdth" 50"#);
+    assert_eq!(variations.len(), 2);
+    assert_eq!(variations[0].tag, 0x77676874);
+    assert_eq!(variations[1].tag, 0x77647468);
+  }
+}
