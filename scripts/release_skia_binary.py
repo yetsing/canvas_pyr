@@ -54,12 +54,8 @@ def download():
             ],
             check=True,
         )
-    if PLATFORM_NAME == "win32":
+    if PLATFORM_NAME == "windows":
         download_icu()
-        shutil.copy2(
-            os.path.join(dirname, "..", ICU_DAT),
-            os.path.join(dirname, "..", "npm", "win32-x64-msvc", ICU_DAT),
-        )
 
 
 def download_icu():
@@ -81,7 +77,7 @@ def download_icu():
     )
     shutil.copy2(
         os.path.join(dirname, "..", ICU_DAT),
-        os.path.join(dirname, "..", "npm", "win32-x64-msvc", ICU_DAT),
+        os.path.join(dirname, "..", "pkgdata", ICU_DAT),
     )
 
 

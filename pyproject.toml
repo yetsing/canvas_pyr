@@ -21,6 +21,10 @@ dev = [
     "tomli==2.4.0",
 ]
 
+[tool.maturin]
+# Include additional files
+include = ["pkgdata/**/*"]
+
 [tool.uv]
 package = false
 
