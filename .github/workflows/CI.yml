@@ -25,7 +25,7 @@ jobs:
     name: Lint SourceCode
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/brooooooklyn/canvas/ubuntu-builder:jammy
+      image: ghcr.io/yetsing/canvas_pyr/ubuntu-builder:latest
 
     steps:
       - uses: actions/checkout@v6
@@ -35,10 +35,10 @@ jobs:
       - name: Setup python
         uses: actions/setup-python@v6
 
-      - name: Install
-        uses: ./.github/actions/setup-rust
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin
+          target: x86_64-unknown-linux-gnu
           components: clippy, rustfmt
 
       - name: Download skia binary
@@ -65,54 +65,68 @@ jobs:
         run: clang-format --Werror --style=Chromium --fail-on-incomplete-format --dry-run skia-c/*
 
   build_wheels:
-    name: ${{ matrix.platform.os }}-${{ matrix.platform.runner }}-${{ matrix.python-version }}-${{ matrix.platform.target }}
-    runs-on: ${{ matrix.platform.runner }}
+    name: ${{ matrix.conf.os }}-${{ matrix.conf.runner }}-${{ matrix.python-version }}-${{ matrix.conf.target }}
+    runs-on: ${{ matrix.conf.runner }}
     strategy:
       matrix:
         python-version:
           - '3.10'
-        platform:
-          - runner: ubuntu-22.04
+        conf:
+          - runner: ubuntu-latest
             target: x86_64
             manylinux: manylinux_2_34
             os: linux
+            downloadTarget: ''
+            target-triple: x86_64-unknown-linux-gnu
             docker: ghcr.io/yetsing/canvas_pyr/ubuntu-builder:latest
             build: |
               bash scripts/build_linux_x86_64.sh
           - runner: windows-latest
             target: x86_64
             os: windows
+            downloadTarget: ''
+            target-triple: x86_64-pc-windows-msvc
           - runner: macos-15-intel
             target: x86_64
             os: macos
+            downloadTarget: ''
+            target-triple: x86_64-apple-darwin
           - runner: macos-latest
             target: aarch64
             os: macos
+            downloadTarget: 'aarch64-apple-darwin'
+            target-triple: aarch64-apple-darwin
+
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+
       - name: Download skia binary
-        run: |
-          git config --global --add safe.directory $(pwd)
-          python3 ./scripts/release_skia_binary.py --download
+        run: python ./scripts/release_skia_binary.py --download --target=${{ matrix.conf.downloadTarget }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.conf.target-triple }}
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
-        if: ${{ !matrix.platform.docker }}
+        if: ${{ !matrix.conf.docker }}
         with:
-          target: ${{ matrix.platform.target }}
+          target: ${{ matrix.conf.target }}
           args: -i python${{ matrix.python-version }} --release --out dist --compatibility pypi
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          manylinux: ${{ matrix.platform.manylinux }}
+          manylinux: ${{ matrix.conf.manylinux }}
 
       - name: Build in docker
-        uses: addnab/docker-run-action@v3
-        if: ${{ matrix.platform.docker }}
+        uses: maus007/docker-run-action-fork@v1
+        if: ${{ matrix.conf.docker }}
         with:
-          image: ${{ matrix.platform.docker }}
+          image: ${{ matrix.conf.docker }}
           options: --user 0:0 -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index -v ${{ github.workspace }}:/build -w /build -e python_version=${{ matrix.python-version }}
-          run: ${{ matrix.platform.build }}
+          run: ${{ matrix.conf.build }}
 
       - name: Install built wheel and Test
         run: |
@@ -127,7 +141,7 @@ jobs:
         uses: actions/upload-artifact@v5
         if: ${{ ( startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/tags/') ) }}
         with:
-          name: wheels-cp${{ matrix.python-version }}-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          name: wheels-cp${{ matrix.python-version }}-${{ matrix.conf.os }}-${{ matrix.conf.target }}
           path: dist
 
   sdist:
