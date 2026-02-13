@@ -30,14 +30,14 @@ def skip_if_sign(version: str) -> bool:
     return (
         sign_path.exists()
         and sign_path.is_file()
-        and sign_path.read_text().strip() == version
+        and sign_path.read_text(encoding="utf-8").strip() == version
     )
 
 
 def make_sign(version: str):
     sign_path = upstream_dir / "version_sign.txt"
     sign_path.parent.mkdir(parents=True, exist_ok=True)
-    sign_path.write_text(version)
+    sign_path.write_text(version, encoding="utf-8")
 
 
 def safe_extract(zip_path: str | Path, dest_dir: str | Path) -> None:

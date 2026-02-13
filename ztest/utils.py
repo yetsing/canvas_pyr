@@ -37,7 +37,7 @@ class BaseTestCase(unittest.TestCase):
             return s.replace("␊", "\n")  # unescape newlines in snapshot data
 
         snap_path = self._test_path(filename)
-        lines = snap_path.read_text().splitlines()
+        lines = snap_path.read_text(encoding="utf-8").splitlines()
 
         mapping = {}
         name = ""
