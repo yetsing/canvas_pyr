@@ -11,6 +11,8 @@ dependencies = []
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
 ]
 dynamic = ["version"]
 
@@ -24,6 +26,8 @@ dev = [
 [tool.maturin]
 # Include additional files
 include = ["pkgdata/**/*"]
+# Exclude files
+exclude = ["pkgdata/.keep"]
 
 [tool.uv]
 package = false
