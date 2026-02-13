@@ -33,7 +33,7 @@ jobs:
       - name: Build and push Linux
         uses: docker/build-push-action@v6
         with:
-          file: dockerfiles/Dockerfile
+          file: scripts/Dockerfile
           context: .
           platforms: linux/amd64
           push: true
@@ -61,7 +61,7 @@ jobs:
       - name: Build and push Linux aarch64
         uses: docker/build-push-action@v6
         with:
-          file: dockerfiles/aarch64.Dockerfile
+          file: scripts/aarch64.Dockerfile
           context: .
           platforms: linux/amd64
           push: true

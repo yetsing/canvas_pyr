@@ -7,18 +7,63 @@ name: CI
 
 on:
   push:
-    branches-ignore:
+    branches:
       - main
       - master
-    # tags:
-      # - '*'
-  # pull_request:
-  # workflow_dispatch:
+    tags:
+      - '*'
+  pull_request:
+  release:
+    types:
+      - published
 
 permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Lint SourceCode
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/brooooooklyn/canvas/ubuntu-builder:jammy
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+
+      - name: Install
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-apple-darwin
+          components: clippy, rustfmt
+
+      - name: Download skia binary
+        run: |
+          git config --global --add safe.directory $(pwd)
+          python3 ./scripts/release_skia_binary.py --download
+
+      - name: Cargo fmt
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy
+
+  lint-cpp:
+    name: Lint C++ Code
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: brew install clang-format
+
+      - name: Format C++ Code
+        run: clang-format --Werror --style=Chromium --fail-on-incomplete-format --dry-run skia-c/*
+
   build_wheels:
     name: ${{ matrix.platform.os }}-${{ matrix.platform.runner }}-${{ matrix.python-version }}-${{ matrix.platform.target }}
     runs-on: ${{ matrix.platform.runner }}
@@ -31,10 +76,9 @@ jobs:
             target: x86_64
             manylinux: manylinux_2_34
             os: linux
-          - runner: ubuntu-22.04
-            target: x86_64
-            manylinux: musllinux_1_2
-            os: musllinux
+            docker: ghcr.io/yetsing/canvas_pyr/ubuntu-builder:latest
+            build: |
+              bash scripts/build_linux_x86_64.sh
           - runner: windows-latest
             target: x86_64
             os: windows
@@ -49,15 +93,41 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Download skia binary
+        run: |
+          git config --global --add safe.directory $(pwd)
+          python3 ./scripts/release_skia_binary.py --download
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        if: ${{ !matrix.platform.docker }}
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --compatibility pypi -i python${{ matrix.python-version }}
+          args: -i python${{ matrix.python-version }} --release --out dist --compatibility pypi
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: ${{ matrix.platform.manylinux }}
+
+      - name: Build in docker
+        uses: addnab/docker-run-action@v3
+        if: ${{ matrix.platform.docker }}
+        with:
+          image: ${{ matrix.platform.docker }}
+          options: --user 0:0 -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index -v ${{ github.workspace }}:/build -w /build -e python_version=${{ matrix.python-version }}
+          run: ${{ matrix.platform.build }}
+
+      - name: Install built wheel and Test
+        run: |
+          # Second install guarantees it's going to install from local dir w/ --no-index
+          # use first to get in dev dependencies
+          python -m pip install canvas-pyr[dev] --pre --find-links dist --force-reinstall
+          python -m pip install canvas-pyr --pre --no-index --find-links dist --force-reinstall
+
+          python ztest/main.py
+
       - name: Upload wheels
         uses: actions/upload-artifact@v5
+        if: ${{ ( startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/tags/') ) }}
         with:
           name: wheels-cp${{ matrix.python-version }}-${{ matrix.platform.os }}-${{ matrix.platform.target }}
           path: dist
@@ -73,6 +143,7 @@ jobs:
           args: --out dist
       - name: Upload sdist
         uses: actions/upload-artifact@v5
+        if: ${{ ( startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/tags/') ) }}
         with:
           name: wheels-sdist
           path: dist
@@ -80,7 +151,8 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    # if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    if: github.event_name == 'release' && github.event.action == 'published'
     needs: [build_wheels, sdist]
     permissions:
       # Use to sign the release artifacts
@@ -96,10 +168,10 @@ jobs:
         with:
           subject-path: 'wheels-*/*'
       - name: Install uv
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        # if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: astral-sh/setup-uv@v7
       - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        # if: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: uv publish 'wheels-*/*'
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.pypi_password }}
