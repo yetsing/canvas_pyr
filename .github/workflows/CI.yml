@@ -147,6 +147,7 @@ jobs:
           python -m pip install canvas-pyr[dev] --pre --find-links dist --force-reinstall
           python -m pip install canvas-pyr --pre --no-index --find-links dist --force-reinstall
 
+          python ztest/download_resource.py
           python ztest/main.py
 
       - name: Upload wheels
