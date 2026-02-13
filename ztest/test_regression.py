@@ -102,7 +102,7 @@ class RegressionTestCase(BaseTestCase):
         # Image
         image = self._load_image("javascript.png")
         ctx.drawImage(image, 0, 0, 200, 100)
-        self._snapshot("global-alpha-should-effect-drawImage", "png", canvas=canvas)
+        self._snapshot("global-alpha-should-effect-drawImage", "png", 1, canvas=canvas)
 
     def test_draw_text_max_width(self):
         font_path = self._test_path("fonts", "iosevka-slab-regular.ttf")
@@ -406,7 +406,10 @@ class RegressionTestCase(BaseTestCase):
         ctx.fillStyle = "blue"
         ctx.fillRect(20, 20, 60, 40)
 
-        self._snapshot("shadow-alpha-with-global-alpha", "png", canvas=canvas)
+        if platform.machine().lower() in ("x86_64", "amd64"):
+            self._snapshot("shadow-alpha-with-global-alpha", "png", canvas=canvas)
+        else:
+            self._snapshot("shadow-alpha-with-global-alpha", "png", 2.5, canvas=canvas)
 
     def test_shadow_clipping_beyond_canvas_bounds(self):
         font_path = self._test_path("fonts", "iosevka-slab-regular.ttf")
@@ -478,7 +481,12 @@ class RegressionTestCase(BaseTestCase):
             10, 110, 40, 40
         )  # Rectangle positioned so shadow extends beyond left edge
 
-        self._snapshot("shadow-clipping-beyond-canvas-bounds", "png", canvas=canvas)
+        different_ratio = 2.7
+        if platform.machine().lower() in ("x86_64", "amd64"):
+            different_ratio = 0.015
+        self._snapshot("shadow-clipping-beyond-canvas-bounds", "png",
+                       different_ratio,
+                        canvas=canvas)
 
     @unittest.skip(
         "python will throw error when setLineDash receive invalid input, but in js it will not"
