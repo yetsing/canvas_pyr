@@ -93,8 +93,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
       - name: Download skia binary
         run: |
           git config --global --add safe.directory $(pwd)
