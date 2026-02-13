@@ -34,7 +34,7 @@ def lib_path(
 ) -> dict[str, str]:
     platform_name: str
     if not triple:
-        if host_platform == "win32":
+        if host_platform == "windows":
             platform_name = f"{lib}-win32-x64-msvc.lib"
         elif host_platform == "darwin":
             platform_name = f"lib{lib}-darwin-x64.a"
